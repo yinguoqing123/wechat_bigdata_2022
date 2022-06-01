@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from transformers import BertTokenizer
+from sklearn.model_selection import train_test_split
 
 from category_id_map import category_id_to_lv2id
 
@@ -16,9 +17,12 @@ def create_dataloaders(args):
     dataset = MultiModalDataset(args, args.train_annotation, args.train_zip_feats)
     size = len(dataset)
     val_size = int(size * args.val_ratio)
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [size - val_size, val_size],
-                                                               generator=torch.Generator().manual_seed(args.seed))
-
+    # train_dataset, val_dataset = torch.utils.data.random_split(dataset, [size - val_size, val_size],
+    #                                                            generator=torch.Generator().manual_seed(args.seed))
+    # 分层抽样
+    train_indices, test_indices = train_test_split(list(range(len(dataset.labels))), test_size=args.val_ratio, random_state=2022, 
+                                                    stratify=dataset.labels)
+    train_dataset, val_dataset = torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, test_indices)
     if args.num_workers > 0:
         dataloader_class = partial(DataLoader, pin_memory=True, num_workers=args.num_workers, prefetch_factor=args.prefetch)
     else:
@@ -48,7 +52,7 @@ class MultiModalDataset(Dataset):
         zip_feats (str): visual feature zip file path.
         test_mode (bool): if it's for testing.
     """
-
+    
     def __init__(self,
                  args,
                  ann_path: str,
@@ -57,7 +61,6 @@ class MultiModalDataset(Dataset):
         self.max_frame = args.max_frames
         self.bert_seq_length = args.bert_seq_length
         self.test_mode = test_mode
-
         self.zip_feat_path = zip_feats
         self.num_workers = args.num_workers
         if self.num_workers > 0:
@@ -70,10 +73,11 @@ class MultiModalDataset(Dataset):
             self.anns = json.load(f)
         # initialize the text tokenizer
         self.tokenizer = BertTokenizer.from_pretrained(args.bert_dir, use_fast=True, cache_dir=args.bert_cache)
-
+        self.labels = [self.anns[idx]['category_id'] for idx in range(len(self.anns))]
+        
     def __len__(self) -> int:
         return len(self.anns)
-
+    
     def get_visual_feats(self, idx: int) -> tuple:
         # read data from zipfile
         vid = self.anns[idx]['id']
@@ -87,7 +91,7 @@ class MultiModalDataset(Dataset):
         raw_feats = np.load(BytesIO(handle.read(name=f'{vid}.npy')), allow_pickle=True)
         raw_feats = raw_feats.astype(np.float32)  # float16 to float32
         num_frames, feat_dim = raw_feats.shape
-
+        
         feat = np.zeros((self.max_frame, feat_dim), dtype=np.float32)
         mask = np.ones((self.max_frame,), dtype=np.int32)
         if num_frames <= self.max_frame:
@@ -112,31 +116,57 @@ class MultiModalDataset(Dataset):
         feat = torch.FloatTensor(feat)
         mask = torch.LongTensor(mask)
         return feat, mask
-
+    
     def tokenize_text(self, text: str) -> tuple:
         encoded_inputs = self.tokenizer(text, max_length=self.bert_seq_length, padding='max_length', truncation=True)
         input_ids = torch.LongTensor(encoded_inputs['input_ids'])
         mask = torch.LongTensor(encoded_inputs['attention_mask'])
         return input_ids, mask
-
+    
+    def tokenize_text2(self, title: str, ocr_text: str, asr_text: str) -> tuple:
+        encoded_titles = self.tokenizer(title, max_length=64, padding='max_length', truncation=True, add_special_tokens=False)
+        encoded_ocr = self.tokenizer(ocr_text, max_length=128, padding='max_length', truncation=True, add_special_tokens=False)
+        encoded_asr = self.tokenizer(asr_text, max_length=128, padding='max_length', truncation=True, add_special_tokens=False)
+        text_input_ids = torch.LongTensor([self.tokenizer.cls_token_id] + encoded_titles['input_ids'] + [self.tokenizer.sep_token_id] + \
+            encoded_ocr['input_ids'] + [self.tokenizer.sep_token_id] + encoded_asr['input_ids'] + [self.tokenizer.sep_token_id])
+        text_mask = torch.LongTensor([1,] + encoded_titles['attention_mask'] + [1,] + encoded_ocr['attention_mask'] + [1, ] + \
+            encoded_asr['attention_mask'] + [1, ])
+        text_token_type_ids = torch.zeros_like(text_input_ids)
+        return text_input_ids, text_mask, text_token_type_ids
+    
+    def tokenize_img(self, idx: int) -> tuple:
+        frame_input, frame_mask = self.get_visual_feats(idx)
+        frame_token_type_ids = torch.ones_like(frame_mask)
+        return frame_input, frame_mask, frame_token_type_ids
+    
     def __getitem__(self, idx: int) -> dict:
         # Step 1, load visual features from zipfile.
-        frame_input, frame_mask = self.get_visual_feats(idx)
-
+        # frame_input, frame_mask = self.get_visual_feats(idx)
+        
         # Step 2, load title tokens
-        title_input, title_mask = self.tokenize_text(self.anns[idx]['title'])
-
+        # title_input, title_mask = self.tokenize_text(self.anns[idx]['title'])
+        
+        
+        # title ocr asr
+        title, asr = self.anns[idx]['title'], self.anns[idx]['asr']
+        ocr = sorted(self.anns[idx]['ocr'], key = lambda x: x['time'])
+        ocr = ','.join([t['text'] for t in ocr])
+        text_input, text_mask, text_token_type_ids = self.tokenize_text2(title, ocr, asr)
+        frame_input, frame_mask, frame_token_type_ids = self.tokenize_img(idx)
+        
         # Step 3, summarize into a dictionary
         data = dict(
             frame_input=frame_input,
             frame_mask=frame_mask,
-            title_input=title_input,
-            title_mask=title_mask
+            frame_token_type_ids=frame_token_type_ids,
+            text_input=text_input,
+            text_mask=text_mask,
+            text_token_type_ids=text_token_type_ids
         )
-
+        
         # Step 4, load label if not test mode
         if not self.test_mode:
             label = category_id_to_lv2id(self.anns[idx]['category_id'])
             data['label'] = torch.LongTensor([label])
-
+            
         return data

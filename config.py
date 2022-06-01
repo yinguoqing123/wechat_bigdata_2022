@@ -28,7 +28,7 @@ def parse_args():
     # ========================= Learning Configs ==========================
     parser.add_argument('--max_epochs', type=int, default=20, help='How many epochs')
     parser.add_argument('--max_steps', default=50000, type=int, metavar='N', help='number of total epochs to run')
-    parser.add_argument('--print_steps', type=int, default=20, help="Number of steps to log training metrics.")
+    parser.add_argument('--print_steps', type=int, default=100, help="Number of steps to log training metrics.")
     parser.add_argument('--warmup_steps', default=1000, type=int, help="warm ups for parameters not in bert or vit")
     parser.add_argument('--minimum_lr', default=0., type=float, help='minimum learning rate')
     parser.add_argument('--learning_rate', default=5e-5, type=float, help='initial learning rate')

@@ -1,12 +1,15 @@
 import logging
 import os
+from pickletools import optimize
 import time
 import torch
 
 from config import parse_args
 from data_helper import create_dataloaders
 from model import MultiModal
+from wx_uni_model import WXUniModel
 from util import setup_device, setup_seed, setup_logging, build_optimizer, evaluate
+from create_optimizer import create_optimizer, get_reducelr_schedule, get_warmup_schedule
 
 
 def validate(model, val_dataloader):
@@ -33,8 +36,11 @@ def train_and_validate(args):
     train_dataloader, val_dataloader = create_dataloaders(args)
 
     # 2. build model and optimizers
-    model = MultiModal(args)
-    optimizer, scheduler = build_optimizer(args, model)
+    model = WXUniModel(task=None)
+    # optimizer, scheduler = build_optimizer(args, model)
+    optimizer = create_optimizer(model)
+    scheduler_warmup = get_warmup_schedule(optimizer, num_warmup_steps=5000)
+    scheduler_reducelr = get_reducelr_schedule(optimizer)
     if args.device == 'cuda':
         model = torch.nn.parallel.DataParallel(model.to(args.device))
 
@@ -52,7 +58,7 @@ def train_and_validate(args):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
+            scheduler_warmup.step()
 
             step += 1
             if step % args.print_steps == 0:
@@ -60,19 +66,21 @@ def train_and_validate(args):
                 remaining_time = time_per_step * (num_total_steps - step)
                 remaining_time = time.strftime('%H:%M:%S', time.gmtime(remaining_time))
                 logging.info(f"Epoch {epoch} step {step} eta {remaining_time}: loss {loss:.3f}, accuracy {accuracy:.3f}")
+            if step % 300 == 299:
+                # 4. validation
+                loss, results = validate(model, val_dataloader)
+                results = {k: round(v, 4) for k, v in results.items()}
+                logging.info(f"Epoch {epoch} step {step}: loss {loss:.3f}, {results}")
 
-        # 4. validation
-        loss, results = validate(model, val_dataloader)
-        results = {k: round(v, 4) for k, v in results.items()}
-        logging.info(f"Epoch {epoch} step {step}: loss {loss:.3f}, {results}")
-
-        # 5. save checkpoint
-        mean_f1 = results['mean_f1']
-        if mean_f1 > best_score:
-            best_score = mean_f1
-            state_dict = model.module.state_dict() if args.device == 'cuda' else model.state_dict()
-            torch.save({'epoch': epoch, 'model_state_dict': state_dict, 'mean_f1': mean_f1},
-                       f'{args.savedmodel_path}/model_epoch_{epoch}_mean_f1_{mean_f1}.bin')
+                # 5. save checkpoint
+                mean_f1 = results['mean_f1']
+                scheduler_reducelr.step()
+                if mean_f1 > best_score:
+                    best_score = mean_f1
+                    state_dict = model.module.state_dict() if args.device == 'cuda' else model.state_dict()
+                    torch.save({'epoch': epoch, 'model_state_dict': state_dict, 'mean_f1': mean_f1},
+                            f'{args.savedmodel_path}/model_epoch_{epoch}.bin')
+                    
 
 
 def main():
