@@ -5,6 +5,7 @@ from config import parse_args
 from data_helper import MultiModalDataset
 from category_id_map import lv2id_to_category_id
 from model import MultiModal
+from wx_uni_model import WXUniModel
 
 
 def inference():
@@ -17,11 +18,11 @@ def inference():
                             sampler=sampler,
                             drop_last=False,
                             pin_memory=True,
-                            num_workers=args.num_workers,
-                            prefetch_factor=args.prefetch)
+                            num_workers=args.num_workers
+                            )
 
     # 2. load model
-    model = MultiModal(args)
+    model = WXUniModel(task=[], model_path=args.bert_dir)
     checkpoint = torch.load(args.ckpt_file, map_location='cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     if torch.cuda.is_available():

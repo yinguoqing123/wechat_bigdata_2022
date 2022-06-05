@@ -7,28 +7,34 @@ from functools import partial
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from transformers import BertTokenizer
+from transformers import BertTokenizer, AutoTokenizer
 from sklearn.model_selection import train_test_split
+from collections import Counter
 
-from category_id_map import category_id_to_lv2id
+from category_id_map import category_id_to_lv2id, category_id_to_lv1id
 
 
-def create_dataloaders(args):
-    dataset = MultiModalDataset(args, args.train_annotation, args.train_zip_feats)
-    size = len(dataset)
-    val_size = int(size * args.val_ratio)
-    # train_dataset, val_dataset = torch.utils.data.random_split(dataset, [size - val_size, val_size],
-    #                                                            generator=torch.Generator().manual_seed(args.seed))
-    # 分层抽样
-    train_indices, test_indices = train_test_split(list(range(len(dataset.labels))), test_size=args.val_ratio, random_state=2022, 
-                                                    stratify=dataset.labels)
-    train_dataset, val_dataset = torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, test_indices)
+def create_dataloaders(args, pretrain=False):
+    if pretrain:
+        dataset = MultiModalDataset(args, args.pretrain_annotation, args.pretrain_zip_feats, test_mode=True)
+        size = len(dataset)
+        val_size = 10000
+        train_dataset, val_dataset = torch.utils.data.dataset.random_split(dataset, [size - val_size, val_size])
+    else:
+        dataset = MultiModalDataset(args, args.train_annotation, args.train_zip_feats)
+        size = len(dataset)
+        val_size = int(size * args.val_ratio)
+        # 分层抽样
+        train_indices, test_indices = train_test_split(list(range(len(dataset.labels))), test_size=args.val_ratio, random_state=2022, 
+                                                        stratify=dataset.labels)
+        train_dataset, val_dataset = torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, test_indices)
+    
     if args.num_workers > 0:
-        dataloader_class = partial(DataLoader, pin_memory=True, num_workers=args.num_workers, prefetch_factor=args.prefetch)
+        dataloader_class = partial(DataLoader, pin_memory=True, num_workers=args.num_workers)
     else:
         # single-thread reading does not support prefetch_factor arg
         dataloader_class = partial(DataLoader, pin_memory=True, num_workers=0)
-
+        
     train_sampler = RandomSampler(train_dataset)
     val_sampler = SequentialSampler(val_dataset)
     train_dataloader = dataloader_class(train_dataset,
@@ -72,8 +78,10 @@ class MultiModalDataset(Dataset):
         with open(ann_path, 'r', encoding='utf8') as f:
             self.anns = json.load(f)
         # initialize the text tokenizer
-        self.tokenizer = BertTokenizer.from_pretrained(args.bert_dir, use_fast=True, cache_dir=args.bert_cache)
-        self.labels = [self.anns[idx]['category_id'] for idx in range(len(self.anns))]
+        self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir, use_fast=True, cache_dir=args.bert_cache, do_lower_case=True)
+        self.labels = None
+        if not test_mode:
+            self.labels = [self.anns[idx]['category_id'] for idx in range(len(self.anns))]
         
     def __len__(self) -> int:
         return len(self.anns)
@@ -124,13 +132,13 @@ class MultiModalDataset(Dataset):
         return input_ids, mask
     
     def tokenize_text2(self, title: str, ocr_text: str, asr_text: str) -> tuple:
-        encoded_titles = self.tokenizer(title, max_length=64, padding='max_length', truncation=True, add_special_tokens=False)
-        encoded_ocr = self.tokenizer(ocr_text, max_length=128, padding='max_length', truncation=True, add_special_tokens=False)
-        encoded_asr = self.tokenizer(asr_text, max_length=128, padding='max_length', truncation=True, add_special_tokens=False)
-        text_input_ids = torch.LongTensor([self.tokenizer.cls_token_id] + encoded_titles['input_ids'] + [self.tokenizer.sep_token_id] + \
-            encoded_ocr['input_ids'] + [self.tokenizer.sep_token_id] + encoded_asr['input_ids'] + [self.tokenizer.sep_token_id])
-        text_mask = torch.LongTensor([1,] + encoded_titles['attention_mask'] + [1,] + encoded_ocr['attention_mask'] + [1, ] + \
-            encoded_asr['attention_mask'] + [1, ])
+        encoded_titles = self.tokenizer(title, max_length=64, padding='max_length', truncation=True)
+        encoded_ocr = self.tokenizer(ocr_text, max_length=128, padding='max_length', truncation=True)
+        encoded_asr = self.tokenizer(asr_text, max_length=128, padding='max_length', truncation=True)
+        text_input_ids = torch.LongTensor([self.tokenizer.cls_token_id] + encoded_titles['input_ids'][1:-1] + [self.tokenizer.sep_token_id] + \
+            encoded_ocr['input_ids'][1:-1] + [self.tokenizer.sep_token_id] + encoded_asr['input_ids'][1:-1] + [self.tokenizer.sep_token_id])
+        text_mask = torch.LongTensor([1,] + encoded_titles['attention_mask'][1:-1] + [1,] + encoded_ocr['attention_mask'][1:-1] + [1, ] + \
+            encoded_asr['attention_mask'][1:-1] + [1, ])
         text_token_type_ids = torch.zeros_like(text_input_ids)
         return text_input_ids, text_mask, text_token_type_ids
     
@@ -167,6 +175,36 @@ class MultiModalDataset(Dataset):
         # Step 4, load label if not test mode
         if not self.test_mode:
             label = category_id_to_lv2id(self.anns[idx]['category_id'])
+            lebel_lv1 = category_id_to_lv1id(self.anns[idx]['category_id'])
             data['label'] = torch.LongTensor([label])
+            data['label_lv1'] = torch.LongTensor([lebel_lv1])
             
         return data
+    
+# 计算lv1 lv2 的先验概率
+def get_prior_lv1_lv2(ann_path='../data/annotations/data/labeled.json'):
+    with open(ann_path, 'r', encoding='utf8') as f:
+        anns = json.load(f)
+        
+    lv2 = [line['category_id'] for line in anns]
+    lv2 = Counter(lv2)
+    cnt_lv2 = sum(lv2.values())
+    lv2_prior = {}
+    for key in lv2:
+        lv2_prior[category_id_to_lv2id(key)] = lv2[key] / cnt_lv2
+            
+    lv2_prior = sorted(lv2_prior.items(), key=lambda x: x[0])
+    lv2_prior = np.array([np.log(x[1]) for x in lv2_prior])
+            
+    lv1 = [line['category_id'][:2] for line in anns]
+    lv1 = Counter(lv1)
+    cnt_lv1 = sum(lv1.values())
+    lv1_prior = {}
+    for key in lv1:
+        lv1_prior[key] = lv1[key] / cnt_lv1
+            
+    lv1_prior = sorted(lv1_prior.items(), key=lambda x: x[0])
+    lv1_prior = np.array([np.log(x[1]) for x in lv1_prior])
+    return lv1_prior, lv2_prior
+    
+    

@@ -1,9 +1,12 @@
 import logging
 import random
+import math
 
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score
 import torch
+from torch import nn
+import torch.nn.functional as F
 from transformers import AdamW, get_linear_schedule_with_warmup
 
 from category_id_map import lv2id_to_lv1id
@@ -64,3 +67,38 @@ def evaluate(predictions, labels):
                     'mean_f1': mean_f1}
 
     return eval_results
+
+class ArcFace(nn.Module):
+    """ NN module for projecting extracted embeddings onto the sphere surface """
+    
+    def __init__(self, in_features, out_features, s=30, m=0.5):
+        super(ArcFace, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.cos_m = math.cos(self.m)
+        self.sin_m = math.sin(self.m)
+        self.arc_min = math.cos(math.pi - self.m)
+        self.margin_min = math.sin(math.pi - self.m) * self.m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+    
+    def _update_margin(self, new_margin):
+        self.m = new_margin
+        self.cos_m = math.cos(self.m)
+        self.sin_m = math.sin(self.m)
+        self.arc_min = math.cos(math.pi - self.m)
+        self.margin_min = math.sin(math.pi - self.m) * self.m
+        
+    def forward(self, embedding, label):
+            cos = F.linear(F.normalize(embedding), F.normalize(self.weight))
+            sin = torch.sqrt(1.0 - torch.pow(cos, 2)).clamp(0, 1)
+            phi = cos * self.cos_m - sin * self.sin_m
+            phi = torch.where(cos > self.arc_min, phi, cos - self.margin_min)
+
+            one_hot = torch.zeros(cos.size(), device=embedding.device)
+            one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+            logits = one_hot * phi + (1.0 - one_hot) * cos
+            logits *= self.s
+            return logits

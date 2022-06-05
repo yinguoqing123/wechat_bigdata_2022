@@ -1,4 +1,4 @@
-from transformers import AdamW
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 def create_optimizer(model, model_lr={'others':1e-4, 'nextvlad':5e-4, 'roberta':5e-5},
                      weight_decay=0.01, layerwise_learning_rate_decay=0.975,
@@ -50,7 +50,7 @@ def create_optimizer(model, model_lr={'others':1e-4, 'nextvlad':5e-4, 'roberta':
                 },
                 {
                     "params": [p for n, p in model.named_parameters() if (any(nd in n for nd in no_decay) 
-                                                                          and not any(name in n for name in model_lr) and p.require_grad)],
+                                                                          and not any(name in n for name in model_lr) and p.requires_grad)],
                     "weight_decay": 0.0,
                     "lr": lr,
                 },
@@ -59,8 +59,7 @@ def create_optimizer(model, model_lr={'others':1e-4, 'nextvlad':5e-4, 'roberta':
     optimizer = AdamW(
         optimizer_grouped_parameters,
         lr=model_lr['roberta'],
-        eps=adam_epsilon,
-        correct_bias=not use_bertadam
+        eps=adam_epsilon
     )
     return optimizer
 
@@ -71,5 +70,5 @@ def get_warmup_schedule(optimizer, num_warmup_steps=5000):
     return LambdaLR(optimizer, lr_lambda)
 
 def get_reducelr_schedule(optimiezer, mode='max', factor=0.7, patience=2):
-    return ReduceLROnPlateau(optimiezer, mode='min', factor=factor, patience=patience)
+    return ReduceLROnPlateau(optimiezer, mode=mode, factor=factor, patience=patience)
 
