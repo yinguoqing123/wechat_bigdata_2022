@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampl
 from transformers import BertTokenizer, AutoTokenizer
 from sklearn.model_selection import train_test_split
 from collections import Counter
+import re
 
 from category_id_map import category_id_to_lv2id, category_id_to_lv1id
 
@@ -28,7 +29,8 @@ def create_dataloaders(args, pretrain=False):
         train_indices, test_indices = train_test_split(list(range(len(dataset.labels))), test_size=args.val_ratio, random_state=2022, 
                                                         stratify=dataset.labels)
         train_dataset, val_dataset = torch.utils.data.Subset(dataset, train_indices), torch.utils.data.Subset(dataset, test_indices)
-    
+        resample(train_dataset)
+        
     if args.num_workers > 0:
         dataloader_class = partial(DataLoader, pin_memory=True, num_workers=args.num_workers)
     else:
@@ -132,13 +134,15 @@ class MultiModalDataset(Dataset):
         return input_ids, mask
     
     def tokenize_text2(self, title: str, ocr_text: str, asr_text: str) -> tuple:
-        encoded_titles = self.tokenizer(title, max_length=64, padding='max_length', truncation=True)
-        encoded_ocr = self.tokenizer(ocr_text, max_length=128, padding='max_length', truncation=True)
-        encoded_asr = self.tokenizer(asr_text, max_length=128, padding='max_length', truncation=True)
-        text_input_ids = torch.LongTensor([self.tokenizer.cls_token_id] + encoded_titles['input_ids'][1:-1] + [self.tokenizer.sep_token_id] + \
-            encoded_ocr['input_ids'][1:-1] + [self.tokenizer.sep_token_id] + encoded_asr['input_ids'][1:-1] + [self.tokenizer.sep_token_id])
-        text_mask = torch.LongTensor([1,] + encoded_titles['attention_mask'][1:-1] + [1,] + encoded_ocr['attention_mask'][1:-1] + [1, ] + \
-            encoded_asr['attention_mask'][1:-1] + [1, ])
+        encoded_titles = self.tokenizer(title, max_length=80, truncation=True, add_special_tokens=False)
+        encoded_ocr = self.tokenizer(ocr_text, max_length=200, truncation=True, add_special_tokens=False)
+        encoded_asr = self.tokenizer(asr_text, max_length=200, truncation=True, add_special_tokens=False)
+        text_input_ids = [self.tokenizer.cls_token_id] + encoded_titles['input_ids'][:80] + [self.tokenizer.sep_token_id] + \
+            encoded_ocr['input_ids'][:128] + [self.tokenizer.sep_token_id] + encoded_asr['input_ids'][:128] + [self.tokenizer.sep_token_id]
+        text_input_ids = torch.LongTensor(text_input_ids[:340] + [self.tokenizer.pad_token_id] * (340 - len(text_input_ids)))
+        text_mask = [1,] + encoded_titles['attention_mask'][1:-1] + [1,] + encoded_ocr['attention_mask'][1:-1] + [1, ] + \
+            encoded_asr['attention_mask'][1:-1] + [1, ]
+        text_mask = torch.LongTensor(text_mask[:340] + [0] * (340 - len(text_mask)))
         text_token_type_ids = torch.zeros_like(text_input_ids)
         return text_input_ids, text_mask, text_token_type_ids
     
@@ -157,6 +161,7 @@ class MultiModalDataset(Dataset):
         
         # title ocr asr
         title, asr = self.anns[idx]['title'], self.anns[idx]['asr']
+        asr = re.sub('嗯{3,}', '', asr)
         ocr = sorted(self.anns[idx]['ocr'], key = lambda x: x['time'])
         ocr = ','.join([t['text'] for t in ocr])
         text_input, text_mask, text_token_type_ids = self.tokenize_text2(title, ocr, asr)
@@ -181,8 +186,9 @@ class MultiModalDataset(Dataset):
             
         return data
     
+    
 # 计算lv1 lv2 的先验概率
-def get_prior_lv1_lv2(ann_path='../data/annotations/data/labeled.json'):
+def get_prior_lv1_lv2(ann_path='../data/annotations/labeled.json'):
     with open(ann_path, 'r', encoding='utf8') as f:
         anns = json.load(f)
         
@@ -206,5 +212,49 @@ def get_prior_lv1_lv2(ann_path='../data/annotations/data/labeled.json'):
     lv1_prior = sorted(lv1_prior.items(), key=lambda x: x[0])
     lv1_prior = np.array([np.log(x[1]) for x in lv1_prior])
     return lv1_prior, lv2_prior
+
+def resample(dataset): 
+    anns = dataset.dataset.anns
+    indices = dataset.indices
+    labels = [line['category_id'] for line in anns]
+    label_cnt = Counter(labels)
+    indices_resample = []
+    for idx in indices:
+        if label_cnt[anns[idx]['category_id']] < 300:
+            indices_resample.extend([idx] * 5)
+        elif label_cnt[anns[idx]['category_id']] < 500:
+            indices_resample.extend([idx] * 3)
+        elif label_cnt[anns[idx]['category_id']] < 1000:
+            indices_resample.extend([idx] * 2)
+        else:
+            indices_resample.append(idx)
     
+    dataset.indices = indices_resample
+    print("trainset len:", len(dataset))
     
+def get_weight_lv1_lv2(ann_path='../data/annotations/labeled.json'):
+    with open(ann_path, 'r', encoding='utf8') as f:
+        anns = json.load(f)
+    
+    lv1 = [int(line['category_id'][:2]) for line in anns]
+    lv1 = Counter(lv1)
+    lv1 = sorted(lv1.items(), key=lambda x: x[0])
+    weight_lv1 = []
+    for id, cnt in lv1:
+        if cnt > 5000:
+            weight_lv1.append(0.5)
+        else:
+            weight_lv1.append(1)
+            
+    lv2 = [line['category_id'] for line in anns]
+    lv2 = Counter(lv2)
+    lv2 = sorted(lv2.items(), key=lambda x: x[0])
+    weight_lv2 = []
+    for id, cnt in lv2:
+        if cnt > 3000:
+            weight_lv2.append(0.5)
+        else:
+            weight_lv2.append(1)
+    return weight_lv1, weight_lv2
+
+

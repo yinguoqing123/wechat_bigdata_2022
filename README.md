@@ -49,3 +49,7 @@ python inference.py
 # 因为大家没有groud truth file，本地无法直接运行
 python evaluate.py
 ```
+
+实验记录：
+1. meanpooling、损失函数为互信息有用
+2.

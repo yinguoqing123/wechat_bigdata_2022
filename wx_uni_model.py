@@ -11,7 +11,7 @@ from masklm import MaskLM, MaskVideo, ShuffleVideo
 from transformers.models.bert.modeling_bert import BertConfig, BertOnlyMLMHead
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertEmbeddings, BertEncoder
 from data_helper import get_prior_lv1_lv2
-from util import ArcFace
+from util import ArcFace, FocalLoss
 
 class WXUniModel(nn.Module):
     def __init__(self, model_path, task=[], init_from_pretrain=True, use_arcface_loss=False):
@@ -22,8 +22,8 @@ class WXUniModel(nn.Module):
         self.use_arcface_loss = use_arcface_loss
         
         if not self.use_arcface_loss:
-            self.classify_lv1 = torch.nn.Linear(768, 23)
-            self.classify_lv2 = torch.nn.Linear(768, 200)
+            self.classify_lv1 = torch.nn.Linear(768*2, 23)
+            self.classify_lv2 = torch.nn.Linear(768*2, 200)
         else:
             self.classify_lv1 = ArcFace(768, 23)
             self.classify_lv2 = ArcFace(768, 200)
@@ -87,18 +87,22 @@ class WXUniModel(nn.Module):
         mask = torch.cat([text_mask, frame_mask], dim=-1).float()
         features, lm_prediction_scores = self.roberta(inputs, return_mlm=return_mlm)
         features_mean_pooling = torch.sum(features * mask.unsqueeze(dim=-1), dim=1) / torch.sum(mask, dim=-1, keepdim=True)
+        features_max_pooling, _ = torch.max(features * mask.unsqueeze(dim=-1), dim=1)
+        features_mean_pooling = torch.cat([features_mean_pooling, features_max_pooling], dim=-1)
         # features_mean_pooling = features[:, 0, :]
         
         if not pretrain:
             if self.use_arcface_loss:
+                if inference:
+                    inputs['label_lv1'], inputs['label'] = None, None
                 prediction_lv1 = self.classify_lv1(features_mean_pooling, inputs['label_lv1'])
                 prediction_lv2 = self.classify_lv2(features_mean_pooling, inputs['label'])
             else:
                 prediction_lv1 = self.classify_lv1(features_mean_pooling)
                 prediction_lv2 = self.classify_lv2(features_mean_pooling)
             # if not inference:
-            #     prediction_lv1 = prediction_lv1 + self.prior_lv1.unsqueeze(dim=0) 
-            #     prediction_lv2 = prediction_lv2 + self.prior_lv2.unsqueeze(dim=0)
+            prediction_lv1 = prediction_lv1 + self.prior_lv1.unsqueeze(dim=0) 
+            prediction_lv2 = prediction_lv2 + self.prior_lv2.unsqueeze(dim=0)
         
         # compute loss
         
@@ -114,8 +118,7 @@ class WXUniModel(nn.Module):
             loss += masked_vm_loss / 3 / len(sample_task)
             
         if 'itm' in sample_task:
-            text_feature = features[:, :text_input_ids.size()[1], :]
-            text_feature = text_feature[:, 0, :]
+            text_feature = features[:, 0, :]
             item_pred = self.newfc_itm(text_feature)
             itm_loss = nn.BCEWithLogitsLoss()(item_pred.view(-1), video_text_match_label.view(-1))
             loss += torch.log(itm_loss + 1e-12)
@@ -125,15 +128,27 @@ class WXUniModel(nn.Module):
         elif pretrain:
             return self.cal_pretrain_metric(loss, mlm_pred, lm_label, item_pred, video_text_match_label)
         else:
-            return self.cal_loss(prediction_lv1, prediction_lv2, inputs['label_lv1'], inputs['label'])  # loss_category, accuracy, pred_label_id, label 
+            return self.cal_loss(prediction_lv1, prediction_lv2, inputs['label_lv1'], inputs['label'], focal_loss=False)  # loss_category, accuracy, pred_label_id, label 
     
     @staticmethod
-    def cal_loss(prediction_lv1, prediction_lv2, label_lv1, label_lv2):
+    def cal_loss(prediction_lv1, prediction_lv2, label_lv1, label_lv2, focal_loss=False):
+        weight_lv1 = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 0.5, 0.5, 1, 1, 1, 0.5, 0.5, 0.5, 1, 1, 0.5], device='cuda')
+        weight_lv2 = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 0.5, 1, 1, 0.5, 1, 1, 1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 0.5, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 0.5, 1, 1, 1, 1, 0.5, 1, 1, 1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], device='cuda')
         label_lv1 = label_lv1.squeeze(dim=1)
         label_lv2 = label_lv2.squeeze(dim=1)
-        loss_lv1 = F.cross_entropy(prediction_lv1, label_lv1)
-        loss_lv2 = F.cross_entropy(prediction_lv2, label_lv2)
-        loss = 0.5 * loss_lv1 + loss_lv2
+        if focal_loss:
+            loss_lv1 = FocalLoss()(prediction_lv1, label_lv1)
+            loss_lv2 = FocalLoss()(prediction_lv2, label_lv2)
+        else:
+            loss_lv1 = F.cross_entropy(prediction_lv1, label_lv1, weight_lv1)
+            loss_lv2 = F.cross_entropy(prediction_lv2, label_lv2, weight_lv2)
+        loss = 0.8 * loss_lv1 + loss_lv2
         with torch.no_grad():
             pred_label_id = torch.argmax(prediction_lv2, dim=1)
             accuracy = (label_lv2 == pred_label_id).float().sum() / label_lv2.shape[0]
@@ -251,8 +266,9 @@ class UniBert(BertPreTrainedModel):
         self.config = config
 
         self.embeddings = BertEmbeddings(config)
-        self.video_fc = torch.nn.Linear(768, config.hidden_size)
-        self.video_embeddings = BertEmbeddings(config)
+        self.video_fc1 = torch.nn.Linear(768, config.hidden_size)
+        self.video_fc2 = torch.nn.Linear(config.hidden_size, config.hidden_size)
+        # self.video_embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
 
         self.init_weights()
@@ -271,10 +287,12 @@ class UniBert(BertPreTrainedModel):
     def forward(self, inputs, gather_index=None):
         frame_feature, frame_mask, frame_token_type_ids = inputs['frame_input'], inputs['frame_mask'], inputs['frame_token_type_ids']
         text_input_ids, text_mask, text_token_type_ids = inputs['text_input'], inputs['text_mask'], inputs['text_token_type_ids']
-        frame_feature = torch.tanh(self.video_fc(frame_feature))
+        # frame_feature = torch.tanh(self.video_fc(frame_feature))
+        frame_feature = self.video_fc1(frame_feature)
+        frame_feature = self.video_fc2(torch.relu(frame_feature))
         text_emb = self.embeddings(input_ids=text_input_ids, token_type_ids=text_token_type_ids)
-        frame_emb = self.video_embeddings(inputs_embeds=frame_feature, token_type_ids=frame_token_type_ids)
-
+        # frame_emb = self.video_embeddings(inputs_embeds=frame_feature, token_type_ids=frame_token_type_ids)
+        frame_emb = self.embeddings(inputs_embeds=frame_feature, token_type_ids=frame_token_type_ids)
         embedding_output = torch.cat([text_emb, frame_emb], 1)
         mask = torch.cat([text_mask, frame_mask], 1)
         mask = mask[:, None, None, :]

@@ -10,6 +10,7 @@ from model import MultiModal
 from wx_uni_model import WXUniModel
 from util import setup_device, setup_seed, setup_logging, build_optimizer, evaluate
 from create_optimizer import create_optimizer, get_reducelr_schedule, get_warmup_schedule
+from util import FGM
 
 def validate(model, val_dataloader):
     model.eval()
@@ -35,7 +36,8 @@ def train_and_validate(args):
     train_dataloader, val_dataloader = create_dataloaders(args)
     
     # 2. build model and optimizers
-    model = WXUniModel(task=[], model_path=args.bert_dir, use_arcface_loss=True)
+    model = WXUniModel(task=[], model_path=args.bert_dir, use_arcface_loss=False)
+    fgm = FGM(model)
     # optimizer, scheduler = build_optimizer(args, model)
     optimizer = create_optimizer(model)
     scheduler_warmup = get_warmup_schedule(optimizer, num_warmup_steps=args.bert_warmup_steps)
@@ -58,6 +60,13 @@ def train_and_validate(args):
             loss = loss.mean() / accumulation_steps
             accuracy = accuracy.mean()
             loss.backward() 
+            if step > 3000:
+                fgm.attack()
+                loss_adv, accuracy, _, _ = model(batch)
+                accuracy = accuracy.mean()
+                loss_adv.backward()
+                fgm.restore()
+                
             if step % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -68,7 +77,8 @@ def train_and_validate(args):
                 remaining_time = time_per_step * (num_total_steps - step)
                 remaining_time = time.strftime('%H:%M:%S', time.gmtime(remaining_time))
                 logging.info(f"Epoch {epoch} step {step} eta {remaining_time}: loss {loss:.3f}, accuracy {accuracy:.3f}")
-            if step % 800 == 0:
+                
+            if step % 1000 == 0:
                 # 4. validation
                 loss, results = validate(model, val_dataloader)
                 results = {k: round(v, 4) for k, v in results.items()}
@@ -100,5 +110,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-torch.save()
