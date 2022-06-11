@@ -50,9 +50,9 @@ class NeXtVLAD(nn.Module):
         self.cluster_size = cluster_size
         self.groups = groups
         self.drop_rate = dropout
-
+        
         self.new_feature_size = self.expansion_size * self.feature_size // self.groups
-
+        
         self.dropout = torch.nn.Dropout(self.drop_rate)
         self.expansion_linear = torch.nn.Linear(self.feature_size, self.expansion_size * self.feature_size)
         self.group_attention = torch.nn.Linear(self.expansion_size * self.feature_size, self.groups)
@@ -61,7 +61,7 @@ class NeXtVLAD(nn.Module):
         self.cluster_weight = torch.nn.Parameter(
             torch.nn.init.normal_(torch.rand(1, self.new_feature_size, self.cluster_size), std=0.01))
         self.fc = torch.nn.Linear(self.new_feature_size * self.cluster_size, self.output_size)
-
+        
     def forward(self, inputs, mask):
         # todo mask
         inputs = self.expansion_linear(inputs)

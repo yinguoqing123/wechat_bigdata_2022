@@ -52,4 +52,6 @@ python evaluate.py
 
 实验记录：
 1. meanpooling、损失函数为互信息有用
-2.
+2. focal loss 没用，可能需要精细调参
+3. 重采样有用
+4. --

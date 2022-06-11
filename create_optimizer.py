@@ -1,6 +1,6 @@
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
-def create_optimizer(model, model_lr={'others':1e-4, 'nextvlad':5e-4, 'roberta':5e-5},
+def create_optimizer(model, model_lr={'others':1e-4, 'nextvlad':1e-4, 'roberta':5e-5},
                      weight_decay=0.01, layerwise_learning_rate_decay=0.975,
                      adam_epsilon=1e-6, use_bertadam = False):
     # Get layer learning_rates

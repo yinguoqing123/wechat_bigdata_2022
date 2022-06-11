@@ -22,7 +22,7 @@ def inference():
                             )
 
     # 2. load model
-    model = WXUniModel(task=[], model_path=args.bert_dir)
+    model = WXUniModel(args, task=[])
     checkpoint = torch.load(args.ckpt_file, map_location='cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     if torch.cuda.is_available():

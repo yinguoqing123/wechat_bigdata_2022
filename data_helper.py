@@ -162,8 +162,12 @@ class MultiModalDataset(Dataset):
         # title ocr asr
         title, asr = self.anns[idx]['title'], self.anns[idx]['asr']
         asr = re.sub('嗯{3,}', '', asr)
+        if len(asr) > 128:
+            asr = asr[:64] + ',' + asr[-64:]
         ocr = sorted(self.anns[idx]['ocr'], key = lambda x: x['time'])
         ocr = ','.join([t['text'] for t in ocr])
+        if len(ocr) > 128:
+            ocr = ocr[:64] + ',' + ocr[-64:]
         text_input, text_mask, text_token_type_ids = self.tokenize_text2(title, ocr, asr)
         frame_input, frame_mask, frame_token_type_ids = self.tokenize_img(idx)
         
@@ -220,7 +224,7 @@ def resample(dataset):
     label_cnt = Counter(labels)
     indices_resample = []
     for idx in indices:
-        if label_cnt[anns[idx]['category_id']] < 300:
+        if label_cnt[anns[idx]['category_id']] < 100:
             indices_resample.extend([idx] * 5)
         elif label_cnt[anns[idx]['category_id']] < 500:
             indices_resample.extend([idx] * 3)
