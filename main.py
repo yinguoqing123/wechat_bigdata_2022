@@ -14,21 +14,27 @@ from util import FGM, EMA
 
 def validate(model, val_dataloader):
     model.eval()
-    predictions = []
+    predictions_text, predictions_frame, predictions_union = []
     labels = []
-    losses = []
+    losses = {}
     with torch.no_grad():
         for batch in val_dataloader:
-            loss, _, pred_label_id, label = model(batch)
+            loss, text_result, frame_result, union_result = model(batch)
             loss = loss.mean()
-            predictions.extend(pred_label_id.cpu().numpy())
-            labels.extend(label.cpu().numpy())
+            predictions_text.extend(text_result['pred_label_id'].cpu().numpy())
+            predictions_frame.extend(frame_result['pred_label_id'].cpu().numpy())
+            predictions_union.extend(union_result['pred_label_id'].cpu().numpy())
+            labels.extend(text_result.cpu().numpy())
             losses.append(loss.cpu().numpy())
     loss = sum(losses) / len(losses)
-    results = evaluate(predictions, labels)
+    results_text = evaluate(predictions_text, labels)
+    results_frame = evaluate(predictions_frame, labels)
+    results_union = evaluate(predictions_union, labels)
+    results_text.update(results_frame)
+    results_text.update(results_union)
     
     model.train()
-    return loss, results
+    return loss, results_text
 
 
 def train_and_validate(args):
@@ -58,7 +64,7 @@ def train_and_validate(args):
         for batch in train_dataloader:
             step += 1
             model.train()
-            loss, accuracy, _, _ = model(batch)
+            loss, _, _, _ = model(batch)
             loss = loss.mean() / accumulation_steps
             accuracy = accuracy.mean()
             loss.backward() 

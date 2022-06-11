@@ -46,7 +46,7 @@ def build_optimizer(args, model):
     return optimizer, scheduler
 
 
-def evaluate(predictions, labels):
+def evaluate(predictions, labels, name):
     # prediction and labels are all level-2 class ids
 
     lv1_preds = [lv2id_to_lv1id(lv2id) for lv2id in predictions]
@@ -58,13 +58,13 @@ def evaluate(predictions, labels):
     lv1_f1_macro = f1_score(lv1_labels, lv1_preds, average='macro')
     mean_f1 = (lv2_f1_macro + lv1_f1_macro + lv1_f1_micro + lv2_f1_micro) / 4.0
 
-    eval_results = {'lv1_acc': accuracy_score(lv1_labels, lv1_preds),
-                    'lv2_acc': accuracy_score(labels, predictions),
-                    'lv1_f1_micro': lv1_f1_micro,
-                    'lv1_f1_macro': lv1_f1_macro,
-                    'lv2_f1_micro': lv2_f1_micro,
-                    'lv2_f1_macro': lv2_f1_macro,
-                    'mean_f1': mean_f1}
+    eval_results = {f'lv1_acc_{name}': accuracy_score(lv1_labels, lv1_preds),
+                    f'lv2_acc_{name}': accuracy_score(labels, predictions),
+                    f'lv1_f1_micro_{name}': lv1_f1_micro,
+                    f'lv1_f1_macro_{name}': lv1_f1_macro,
+                    f'lv2_f1_micro_{name}': lv2_f1_micro,
+                    f'lv2_f1_macro_{name}': lv2_f1_macro,
+                    f'mean_f1_{name}': mean_f1}
 
     return eval_results
 
