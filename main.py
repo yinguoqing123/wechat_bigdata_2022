@@ -62,12 +62,12 @@ def train_and_validate(args):
             loss = loss.mean() / accumulation_steps
             accuracy = accuracy.mean()
             loss.backward() 
-            # if step > 3000:
-            #     fgm.attack()
-            #     loss_adv, accuracy, _, _ = model(batch)
-            #     accuracy = accuracy.mean()
-            #     loss_adv.backward()
-            #     fgm.restore()
+            if step > 3000:
+                fgm.attack()
+                loss_adv, accuracy, _, _ = model(batch)
+                accuracy = accuracy.mean()
+                loss_adv.backward()
+                fgm.restore()
                 
             if step > 7000 and first_ema_flag:
                 ema.register()

@@ -172,7 +172,7 @@ class WXUniModel(nn.Module):
             loss_lv1 = F.cross_entropy(prediction_lv1, label_lv1, weight_lv1)
             loss_lv2 = F.cross_entropy(prediction_lv2, label_lv2, weight_lv2)
             loss_lv1_only_frame = F.cross_entropy(prediction_lv1_only_frame, label_lv1, weight_lv1)
-            loss_lv2_only_frame = F.cross_entropy(prediction_lv2_only_frame, label_lv2, weight_lv1)
+            loss_lv2_only_frame = F.cross_entropy(prediction_lv2_only_frame, label_lv2, weight_lv2)
         loss = loss_lv1 + loss_lv2 + loss_lv1_only_frame + loss_lv2_only_frame
         with torch.no_grad():
             pred_label_id = torch.argmax(prediction_lv2, dim=1)
