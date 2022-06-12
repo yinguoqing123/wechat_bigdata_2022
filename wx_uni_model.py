@@ -11,8 +11,7 @@ import sys
 # sys.path.append("..")
 from masklm import MaskLM, MaskVideo, ShuffleVideo
 from transformers import AutoTokenizer
-from transformers.models.bert.modeling_bert import BertConfig, BertOnlyMLMHead
-from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertEncoder, BertPooler
+from modeling_bert import *
 from data_helper import get_prior_lv1_lv2
 from util import ArcFace, FocalLoss
 
@@ -20,8 +19,10 @@ class WXUniModel(nn.Module):
     def __init__(self, args, task=[], init_from_pretrain=True, use_arcface_loss=False):
         super().__init__()
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
+        uni_bert_cfg.update({'output_hidden_states': True})
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
         self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size)
+        self.fusion = ConcatDenseSE(768*3, 768, 8, 0.1)
         
         #uni_bert_cfg.num_hidden_layers = 1
         
@@ -36,6 +37,7 @@ class WXUniModel(nn.Module):
             self.text_classify = Classify(self.prior_lv1, self.prior_lv2, name='text')
             self.frame_classify = Classify(self.prior_lv1, self.prior_lv2, name='frame')
             self.union_classify = Classify(self.prior_lv1, self.prior_lv2, name='union')
+            self.mix_classify = Classify(self.prior_lv1, self.prior_lv2, name='mix')
         else:
             self.classify_lv1 = ArcFace(768, 23, m=0.1)
             self.classify_lv2 = ArcFace(768, 200, m=0.05)
@@ -95,11 +97,18 @@ class WXUniModel(nn.Module):
         #     video_text_match_label = video_text_match_label.to(frame_feature.device)
         
         # 
-        text_output = self.roberta(text_input_ids, text_mask, text_token_type_ids)
-        frame_output = self.roberta(inputs_embeds=frame_feature, frame_mask=frame_mask, token_type_ids=frame_token_type_ids, modal_type='frame')
-        union_output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
+        union_mask = torch.cat([text_mask, frame_mask], dim=-1)
+        text_mask, frame_mask, union_mask = text_mask.float(), frame_mask.float(), union_mask.float()
+        all_output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
                                     frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union')
+        union_output = all_output['last_hidden_state']
+        all_hidden_output = all_output['hidden_states']
+        text_output, frame_output = all_hidden_output[6][:, :text_mask.shape[1], :], all_hidden_output[6][:, text_mask.shape[1]:, :]
         
+        union_pooling = torch.sum(union_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
+        text_pooling = torch.sum(text_output * text_mask.unsqueeze(dim=-1), dim=1) / torch.sum(text_mask, dim=-1, keepdim=True)
+        frame_pooling = torch.sum(frame_output * frame_mask.unsqueeze(dim=-1), dim=1) / torch.sum(frame_mask, dim=-1, keepdim=True)
+        mix_pooling = self.fusion([text_pooling, frame_pooling, union_pooling])
         # features_mean_pooling = torch.sum(features * mask.unsqueeze(dim=-1), dim=1) / torch.sum(mask, dim=-1, keepdim=True)
         # features_max_pooling, _ = torch.max(features * mask.unsqueeze(dim=-1), dim=1)
         # features_mean_pooling = features[:, 0, :]
@@ -112,9 +121,11 @@ class WXUniModel(nn.Module):
                 prediction_lv1 = self.classify_lv1(union_output[:, 0,], inputs['label_lv1'])
                 prediction_lv2 = self.classify_lv2(union_output[:, 0,], inputs['label'])
             else:
-                text_logits1, text_logits2 = self.text_classify(text_output[:, 0, :])  
-                frame_logits1, frame_logits2 = self.frame_classify(frame_output[:, 0, :])  
-                union_logits1, union_logits2 = self.union_classify(union_output[:, 0, :])
+                text_logits1, text_logits2 = self.text_classify(text_pooling)  
+                frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
+                union_logits1, union_logits2 = self.union_classify(union_pooling)
+                mix_logits1, mix_logits2 = self.mix_classify(mix_pooling)
+                
         
         # compute loss
         
@@ -141,8 +152,9 @@ class WXUniModel(nn.Module):
             text_result = self.cal_loss(text_logits1, text_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
             frame_result = self.cal_loss(frame_logits1, frame_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
             union_result = self.cal_loss(union_logits1, union_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            loss = text_result['loss'] + frame_result['loss'] + union_result['loss']
-            return  loss, text_result, frame_result, union_result  # loss_category, accuracy, pred_label_id, label 
+            mix_result = self.cal_loss(mix_logits1, mix_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
+            loss = text_result['loss'] + frame_result['loss'] + union_result['loss'] + mix_result['loss']
+            return  loss, text_result, frame_result, union_result, mix_result  # loss_category, accuracy, pred_label_id, label 
     
     @staticmethod
     def cal_loss(prediction_lv1, prediction_lv2, label_lv1, label_lv2, focal_loss=False):
@@ -305,21 +317,29 @@ class UniBert(BertPreTrainedModel):
 
     # Copied from transformers.models.bert.modeling_bert.BertModel.forward
     def forward(self, input_ids=None, mask=None, token_type_ids=None, gather_index=None, inputs_embeds=None, modal_type='text', frame_mask=None, frame_token_type_ids=None):
-        if modal_type == 'union':
-            frame_embeddings = self.embeddings(inputs_embeds=inputs_embeds, token_type_ids=frame_token_type_ids)
-            text_embeddings = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-            embedding_output = torch.cat([text_embeddings, frame_embeddings], dim=1)
-            mask = torch.cat([mask, frame_mask], dim=1) 
-        elif modal_type == 'frame':
-            # 添加一个[CLS]
-            embedding_output = self.embeddings(token_type_ids=frame_token_type_ids, inputs_embeds=inputs_embeds, type_='frame', cls_token_id=self.cls_token_id)
-            mask = torch.ones_like(embedding_output[..., 0])
-        else:
-            embedding_output = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-        mask = mask[:, None, None, :]   # [batch_size, from_seq_length, to_seq_length]
-        mask = ((1.0 - mask) * -1000000.0).float()
+
+        frame_embeddings = self.embeddings(inputs_embeds=inputs_embeds, token_type_ids=frame_token_type_ids)
+        text_embeddings = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
+        embedding_output = torch.cat([text_embeddings, frame_embeddings], dim=1)
         
-        encoder_outputs = self.encoder(embedding_output, attention_mask=mask)['last_hidden_state']
+        seq_length = embedding_output.size()[1]
+        # cross modal mask
+        cross_mask = torch.cat([mask, frame_mask], dim=1) 
+        cross_mask = cross_mask[:, None, None, :]   # [batch_size, head_num, from_seq_length, to_seq_length]
+        cross_mask = ((1.0 - cross_mask) * -1000000.0).float()
+
+        # single modal mask  文本对文本  图片对图片
+        text_mask = torch.cat([mask, torch.zeros_like(frame_mask)], dim=-1)[:, None, None, :]
+        text_mask = ((1.0 - text_mask) * -1000000.0).float()
+        text_mask = text_mask.expand(-1, -1, seq_length, -1)[..., :mask.shape[0], :]
+
+        frame_mask = torch.cat([torch.zeros_like(mask), frame_mask], dim=-1)[:, None, None, :]
+        frame_mask = ((1.0 - frame_mask) * -1000000.0).float()
+        frame_mask = frame_mask.expand(-1, -1, seq_length, -1)[..., mask.shape[0]:, :]
+
+        single_mask = torch.cat([text_mask, frame_mask], dim=2)
+        
+        encoder_outputs = self.encoder(embedding_output, attention_mask=cross_mask, single_mask=single_mask, output_hidden_states=True)
         return encoder_outputs
 
 class NeXtVLAD(nn.Module):
@@ -365,74 +385,6 @@ class NeXtVLAD(nn.Module):
         vlad = vlad.reshape([-1, 1, self.cluster_size * self.new_feature_size])
         vlad = self.fc(vlad)
         return vlad
-
-class BertEmbeddings(nn.Module):
-    """Construct the embeddings from word, position and token_type embeddings."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
-
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
-        if version.parse(torch.__version__) > version.parse("1.6.0"):
-            self.register_buffer(
-                "token_type_ids",
-                torch.zeros(self.position_ids.size(), dtype=torch.long),
-                persistent=False,
-            )
-
-    def forward(
-        self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0, type_='text', cls_token_id=None
-    ):
-        if type_ == 'frame':
-            assert cls_token_id is not None, 'cls token id must not be none'
-            bsz = inputs_embeds.size()[0]
-            cls_embeddings = self.word_embeddings(torch.tensor(cls_token_id, device=inputs_embeds.device)).expand(bsz, 1, -1)
-            inputs_embeds = torch.cat([cls_embeddings, inputs_embeds], dim=1)
-            if token_type_ids is not None:
-                added_cls_token_type_ids = torch.ones(bsz, 1, dtype=token_type_ids.dtype, device=token_type_ids.device)
-                token_type_ids = torch.cat([added_cls_token_type_ids, token_type_ids], dim=-1)
-            
-        if input_ids is not None:
-            input_shape = input_ids.size()
-        else:
-            input_shape = inputs_embeds.size()[:-1]
-
-        seq_length = input_shape[1]
-
-        if position_ids is None:
-            position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
-
-        # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
-        # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
-        # issue #5664
-        if token_type_ids is None:
-            if hasattr(self, "token_type_ids"):
-                buffered_token_type_ids = self.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
-        if inputs_embeds is None:
-            inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-
-        embeddings = inputs_embeds + token_type_embeddings
-        if self.position_embedding_type == "absolute":
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings += position_embeddings
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-        return embeddings
     
 class Classify(nn.Module):
     def __init__(self, prior_lv1, prior_lv2, name='') -> None:
@@ -447,3 +399,36 @@ class Classify(nn.Module):
         logits1 = self.fc1(input) + self.prior_lv1.unsqueeze(dim=0)
         logits2 = self.fc2(input) + self.prior_lv2.unsqueeze(dim=0)
         return logits1, logits2
+
+
+class SENet(nn.Module):
+    def __init__(self, channels, ratio=8):
+        super().__init__()
+        self.sequeeze = nn.Linear(in_features=channels, out_features=channels // ratio, bias=False)
+        self.relu = nn.ReLU()
+        self.excitation = nn.Linear(in_features=channels // ratio, out_features=channels, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        gates = self.sequeeze(x)
+        gates = self.relu(gates)
+        gates = self.excitation(gates)
+        gates = self.sigmoid(gates)
+        x = torch.mul(x, gates)
+
+        return x
+    
+class ConcatDenseSE(nn.Module):
+    def __init__(self, multimodal_hidden_size, hidden_size, se_ratio, dropout):
+        super().__init__()
+        self.fusion = nn.Linear(multimodal_hidden_size, hidden_size)
+        self.fusion_dropout = nn.Dropout(dropout)
+        self.enhance = SENet(channels=hidden_size, ratio=se_ratio)
+
+    def forward(self, inputs):
+        embeddings = torch.cat(inputs, dim=1)
+        embeddings = self.fusion_dropout(embeddings)
+        embedding = torch.relu(self.fusion(embeddings))
+        embedding = self.enhance(embedding)
+
+        return embedding

@@ -163,11 +163,11 @@ class MultiModalDataset(Dataset):
         title, asr = self.anns[idx]['title'], self.anns[idx]['asr']
         asr = re.sub('嗯{3,}', '', asr)
         if len(asr) > 128:
-            asr = asr[:64] + ',' + asr[-64:]
+            asr = asr[:80] + ',' + asr[-48:]
         ocr = sorted(self.anns[idx]['ocr'], key = lambda x: x['time'])
         ocr = ','.join([t['text'] for t in ocr])
         if len(ocr) > 128:
-            ocr = ocr[:64] + ',' + ocr[-64:]
+            ocr = ocr[:80] + ',' + ocr[-48:]
         text_input, text_mask, text_token_type_ids = self.tokenize_text2(title, ocr, asr)
         frame_input, frame_mask, frame_token_type_ids = self.tokenize_img(idx)
         
