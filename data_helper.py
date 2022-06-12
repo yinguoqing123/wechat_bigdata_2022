@@ -225,9 +225,9 @@ def resample(dataset):
     indices_resample = []
     for idx in indices:
         if label_cnt[anns[idx]['category_id']] < 100:
-            indices_resample.extend([idx] * 5)
-        elif label_cnt[anns[idx]['category_id']] < 500:
             indices_resample.extend([idx] * 3)
+        elif label_cnt[anns[idx]['category_id']] < 500:
+            indices_resample.extend([idx] * 2)
         elif label_cnt[anns[idx]['category_id']] < 1000:
             indices_resample.extend([idx] * 2)
         else:

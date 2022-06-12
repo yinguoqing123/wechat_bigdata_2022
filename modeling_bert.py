@@ -563,8 +563,8 @@ class BertEncoder(nn.Module):
          
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
-            if i < 6:
-                attention_mask = single_mask
+            # if i < 6:
+            #     attention_mask = single_mask
                 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)

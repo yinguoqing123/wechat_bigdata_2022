@@ -19,10 +19,8 @@ class WXUniModel(nn.Module):
     def __init__(self, args, task=[], init_from_pretrain=True, use_arcface_loss=False):
         super().__init__()
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
-        uni_bert_cfg.update({'output_hidden_states': True})
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
-        self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size)
-        self.fusion = ConcatDenseSE(768*3, 768, 8, 0.1)
+        self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size, bias=False)
         
         #uni_bert_cfg.num_hidden_layers = 1
         
@@ -41,6 +39,10 @@ class WXUniModel(nn.Module):
         else:
             self.classify_lv1 = ArcFace(768, 23, m=0.1)
             self.classify_lv2 = ArcFace(768, 200, m=0.05)
+            # self.text_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='text')
+            # self.frame_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='frame')
+            # self.union_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='union')
+            # self.mix_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='mix')
     
         self.task = set(task)
         
@@ -99,16 +101,15 @@ class WXUniModel(nn.Module):
         # 
         union_mask = torch.cat([text_mask, frame_mask], dim=-1)
         text_mask, frame_mask, union_mask = text_mask.float(), frame_mask.float(), union_mask.float()
-        all_output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
-                                    frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union')
-        union_output = all_output['last_hidden_state']
-        all_hidden_output = all_output['hidden_states']
-        text_output, frame_output = all_hidden_output[6][:, :text_mask.shape[1], :], all_hidden_output[6][:, text_mask.shape[1]:, :]
+        last_output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
+                                    frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union', 
+                                    output_hidden_states=False)['last_hidden_state']
+        text_output, frame_output = last_output[:, :text_mask.shape[1], :], last_output[:, text_mask.shape[1]:, :]
         
-        union_pooling = torch.sum(union_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
+        union_pooling = torch.sum(last_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
         text_pooling = torch.sum(text_output * text_mask.unsqueeze(dim=-1), dim=1) / torch.sum(text_mask, dim=-1, keepdim=True)
         frame_pooling = torch.sum(frame_output * frame_mask.unsqueeze(dim=-1), dim=1) / torch.sum(frame_mask, dim=-1, keepdim=True)
-        mix_pooling = self.fusion([text_pooling, frame_pooling, union_pooling])
+        
         # features_mean_pooling = torch.sum(features * mask.unsqueeze(dim=-1), dim=1) / torch.sum(mask, dim=-1, keepdim=True)
         # features_max_pooling, _ = torch.max(features * mask.unsqueeze(dim=-1), dim=1)
         # features_mean_pooling = features[:, 0, :]
@@ -118,14 +119,12 @@ class WXUniModel(nn.Module):
         
         if not pretrain:
             if self.use_arcface_loss:
-                prediction_lv1 = self.classify_lv1(union_output[:, 0,], inputs['label_lv1'])
-                prediction_lv2 = self.classify_lv2(union_output[:, 0,], inputs['label'])
+                prediction_lv1 = self.classify_lv1(union_pooling, inputs['label_lv1'])
+                prediction_lv2 = self.classify_lv2(union_pooling, inputs['label'])
             else:
                 text_logits1, text_logits2 = self.text_classify(text_pooling)  
                 frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
                 union_logits1, union_logits2 = self.union_classify(union_pooling)
-                mix_logits1, mix_logits2 = self.mix_classify(mix_pooling)
-                
         
         # compute loss
         
@@ -152,9 +151,8 @@ class WXUniModel(nn.Module):
             text_result = self.cal_loss(text_logits1, text_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
             frame_result = self.cal_loss(frame_logits1, frame_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
             union_result = self.cal_loss(union_logits1, union_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            mix_result = self.cal_loss(mix_logits1, mix_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            loss = text_result['loss'] + frame_result['loss'] + union_result['loss'] + mix_result['loss']
-            return  loss, text_result, frame_result, union_result, mix_result  # loss_category, accuracy, pred_label_id, label 
+            loss = 0.5 * text_result['loss'] + 0.5 * frame_result['loss'] + union_result['loss'] 
+            return  loss, text_result, frame_result, union_result # loss_category, accuracy, pred_label_id, label 
     
     @staticmethod
     def cal_loss(prediction_lv1, prediction_lv2, label_lv1, label_lv2, focal_loss=False):
@@ -316,7 +314,8 @@ class UniBert(BertPreTrainedModel):
             self.encoder.layer[layer].attention.prune_heads(heads)
 
     # Copied from transformers.models.bert.modeling_bert.BertModel.forward
-    def forward(self, input_ids=None, mask=None, token_type_ids=None, gather_index=None, inputs_embeds=None, modal_type='text', frame_mask=None, frame_token_type_ids=None):
+    def forward(self, input_ids=None, mask=None, token_type_ids=None, gather_index=None, inputs_embeds=None, modal_type='text', frame_mask=None, 
+                frame_token_type_ids=None, output_hidden_states=True):
 
         frame_embeddings = self.embeddings(inputs_embeds=inputs_embeds, token_type_ids=frame_token_type_ids)
         text_embeddings = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
@@ -328,18 +327,18 @@ class UniBert(BertPreTrainedModel):
         cross_mask = cross_mask[:, None, None, :]   # [batch_size, head_num, from_seq_length, to_seq_length]
         cross_mask = ((1.0 - cross_mask) * -1000000.0).float()
 
-        # single modal mask  文本对文本  图片对图片
-        text_mask = torch.cat([mask, torch.zeros_like(frame_mask)], dim=-1)[:, None, None, :]
-        text_mask = ((1.0 - text_mask) * -1000000.0).float()
-        text_mask = text_mask.expand(-1, -1, seq_length, -1)[..., :mask.shape[0], :]
+        # # single modal mask  文本对文本  图片对图片
+        # text_mask = torch.cat([mask, torch.zeros_like(frame_mask)], dim=-1)[:, None, None, :]
+        # text_mask = ((1.0 - text_mask) * -1000000.0).float()
+        # text_mask = text_mask.expand(-1, -1, seq_length, -1)[..., :mask.shape[0], :]
 
-        frame_mask = torch.cat([torch.zeros_like(mask), frame_mask], dim=-1)[:, None, None, :]
-        frame_mask = ((1.0 - frame_mask) * -1000000.0).float()
-        frame_mask = frame_mask.expand(-1, -1, seq_length, -1)[..., mask.shape[0]:, :]
+        # frame_mask = torch.cat([torch.zeros_like(mask), frame_mask], dim=-1)[:, None, None, :]
+        # frame_mask = ((1.0 - frame_mask) * -1000000.0).float()
+        # frame_mask = frame_mask.expand(-1, -1, seq_length, -1)[..., mask.shape[0]:, :]
 
-        single_mask = torch.cat([text_mask, frame_mask], dim=2)
+        # single_mask = torch.cat([text_mask, frame_mask], dim=2)
         
-        encoder_outputs = self.encoder(embedding_output, attention_mask=cross_mask, single_mask=single_mask, output_hidden_states=True)
+        encoder_outputs = self.encoder(embedding_output, attention_mask=cross_mask, output_hidden_states=output_hidden_states)
         return encoder_outputs
 
 class NeXtVLAD(nn.Module):

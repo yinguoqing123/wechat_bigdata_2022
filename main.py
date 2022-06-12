@@ -19,22 +19,19 @@ def validate(model, val_dataloader):
     losses = []
     with torch.no_grad():
         for batch in val_dataloader:
-            loss, text_result, frame_result, union_result, mix_result = model(batch)
+            loss, text_result, frame_result, union_result = model(batch)
             loss = loss.mean()
             predictions_text.extend(text_result['pred_label_id'].cpu().numpy())
             predictions_frame.extend(frame_result['pred_label_id'].cpu().numpy())
             predictions_union.extend(union_result['pred_label_id'].cpu().numpy())
-            predictions_mix.extend(mix_result['pred_label_id'].cpu().numpy())
             labels.extend(text_result['label_lv2'].cpu().numpy())
             losses.append(loss.cpu().numpy())
     loss = sum(losses) / len(losses)
     results_text = evaluate(predictions_text, labels, name='text')
     results_frame = evaluate(predictions_frame, labels, name='frame')
     results_union = evaluate(predictions_union, labels, name='union')
-    results_mix = evaluate(predictions_mix, labels, name='mix')
     results_text.update(results_frame)
     results_text.update(results_union)
-    results_text.update(results_mix)
     
     model.train()
     return loss, results_text
@@ -67,13 +64,13 @@ def train_and_validate(args):
         for batch in train_dataloader:
             step += 1
             model.train()
-            loss, _, _, _, mix_result = model(batch)
+            loss, _, _, mix_result = model(batch)
             loss = loss.mean() / accumulation_steps
             accuracy = mix_result['accuracy'].mean()
             loss.backward() 
             # if step > 3000:
             #     fgm.attack()
-            #     loss_adv, _, _, _, mix_result = model(batch)
+            #     loss_adv, _, _, mix_result = model(batch)
             #     accuracy = mix_result['accuracy'].mean()
             #     loss_adv.backward()
             #     fgm.restore()
