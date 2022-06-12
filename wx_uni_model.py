@@ -2,7 +2,6 @@
 import imp
 import math
 import random
-from xml.sax.handler import feature_namespace_prefixes
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,6 +22,7 @@ class WXUniModel(nn.Module):
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
         self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size)
+        
         #uni_bert_cfg.num_hidden_layers = 1
         
         self.use_arcface_loss = use_arcface_loss
@@ -316,7 +316,7 @@ class UniBert(BertPreTrainedModel):
             mask = torch.ones_like(embedding_output[..., 0])
         else:
             embedding_output = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-        mask = mask[:, None, None, :]
+        mask = mask[:, None, None, :]   # [batch_size, from_seq_length, to_seq_length]
         mask = ((1.0 - mask) * -1000000.0).float()
         
         encoder_outputs = self.encoder(embedding_output, attention_mask=mask)['last_hidden_state']
@@ -396,7 +396,7 @@ class BertEmbeddings(nn.Module):
             assert cls_token_id is not None, 'cls token id must not be none'
             bsz = inputs_embeds.size()[0]
             cls_embeddings = self.word_embeddings(torch.tensor(cls_token_id, device=inputs_embeds.device)).expand(bsz, 1, -1)
-            inputs_embeds = torch.cat([cls_embeddings, inputs_embeds], dim=-1)
+            inputs_embeds = torch.cat([cls_embeddings, inputs_embeds], dim=1)
             if token_type_ids is not None:
                 added_cls_token_type_ids = torch.ones(bsz, 1, dtype=token_type_ids.dtype, device=token_type_ids.device)
                 token_type_ids = torch.cat([added_cls_token_type_ids, token_type_ids], dim=-1)

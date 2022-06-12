@@ -14,9 +14,9 @@ from util import FGM, EMA
 
 def validate(model, val_dataloader):
     model.eval()
-    predictions_text, predictions_frame, predictions_union = []
+    predictions_text, predictions_frame, predictions_union = [], [], []
     labels = []
-    losses = {}
+    losses = []
     with torch.no_grad():
         for batch in val_dataloader:
             loss, text_result, frame_result, union_result = model(batch)
@@ -24,12 +24,12 @@ def validate(model, val_dataloader):
             predictions_text.extend(text_result['pred_label_id'].cpu().numpy())
             predictions_frame.extend(frame_result['pred_label_id'].cpu().numpy())
             predictions_union.extend(union_result['pred_label_id'].cpu().numpy())
-            labels.extend(text_result.cpu().numpy())
+            labels.extend(text_result['label_lv2'].cpu().numpy())
             losses.append(loss.cpu().numpy())
     loss = sum(losses) / len(losses)
-    results_text = evaluate(predictions_text, labels)
-    results_frame = evaluate(predictions_frame, labels)
-    results_union = evaluate(predictions_union, labels)
+    results_text = evaluate(predictions_text, labels, name='text')
+    results_frame = evaluate(predictions_frame, labels, name='frame')
+    results_union = evaluate(predictions_union, labels, name='union')
     results_text.update(results_frame)
     results_text.update(results_union)
     
@@ -64,16 +64,16 @@ def train_and_validate(args):
         for batch in train_dataloader:
             step += 1
             model.train()
-            loss, _, _, _ = model(batch)
+            loss, _, _, union_result = model(batch)
             loss = loss.mean() / accumulation_steps
-            accuracy = accuracy.mean()
+            accuracy = union_result['accuracy'].mean()
             loss.backward() 
-            if step > 3000:
-                fgm.attack()
-                loss_adv, accuracy, _, _ = model(batch)
-                accuracy = accuracy.mean()
-                loss_adv.backward()
-                fgm.restore()
+            # if step > 3000:
+            #     fgm.attack()
+            #     loss_adv, _, _, union_result = model(batch)
+            #     accuracy = union_result['accuracy'].mean()
+            #     loss_adv.backward()
+            #     fgm.restore()
                 
             if step > 7000 and first_ema_flag:
                 ema.register()
@@ -102,7 +102,7 @@ def train_and_validate(args):
                 logging.info(f"Epoch {epoch} step {step}: loss {loss:.3f}, {results}")
                 
                 # 5. save checkpoint
-                mean_f1 = results['mean_f1']
+                mean_f1 = results['mean_f1_union']
                 if mean_f1 > best_score:
                     best_score = mean_f1
                     state_dict = model.module.state_dict() if args.device == 'cuda' else model.state_dict()

@@ -46,7 +46,7 @@ def build_optimizer(args, model):
     return optimizer, scheduler
 
 
-def evaluate(predictions, labels, name):
+def evaluate(predictions, labels, name=''):
     # prediction and labels are all level-2 class ids
 
     lv1_preds = [lv2id_to_lv1id(lv2id) for lv2id in predictions]
