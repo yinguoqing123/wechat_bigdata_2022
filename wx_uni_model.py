@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from packaging import version
+import copy
 
 import sys
 # sys.path.append("..")
@@ -20,29 +21,16 @@ class WXUniModel(nn.Module):
         super().__init__()
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
-        self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size, bias=False)
+        # self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size, bias=False)
         
         #uni_bert_cfg.num_hidden_layers = 1
         
         self.use_arcface_loss = use_arcface_loss
-        
-        self.prior_lv1, self.prior_lv2 = get_prior_lv1_lv2()
-        self.prior_lv1, self.prior_lv2 = torch.tensor(self.prior_lv1, device='cuda', dtype=torch.float), torch.tensor(self.prior_lv2, device='cuda', dtype=torch.float)
-        # self.classify_lv1.bias.data = self.prior_lv1
-        # self.classify_lv2.bias.data = self.prior_lv2
-        
-        if not self.use_arcface_loss:
-            self.text_classify = Classify(self.prior_lv1, self.prior_lv2, name='text')
-            self.frame_classify = Classify(self.prior_lv1, self.prior_lv2, name='frame')
-            self.union_classify = Classify(self.prior_lv1, self.prior_lv2, name='union')
-            self.mix_classify = Classify(self.prior_lv1, self.prior_lv2, name='mix')
-        else:
-            self.classify_lv1 = ArcFace(768, 23, m=0.1)
-            self.classify_lv2 = ArcFace(768, 200, m=0.05)
-            # self.text_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='text')
-            # self.frame_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='frame')
-            # self.union_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='union')
-            # self.mix_classify = ArcFace(self.prior_lv1, self.prior_lv2, name='mix')
+
+        self.text_classify = Classify(768, name='text', use_arcface_loss=False)
+        self.frame_classify = Classify(768, name='frame', use_arcface_loss=False)
+        self.union_classify = Classify(768*2, name='union', use_arcface_loss=False)
+
     
         self.task = set(task)
         
@@ -101,26 +89,20 @@ class WXUniModel(nn.Module):
         # 
         union_mask = torch.cat([text_mask, frame_mask], dim=-1)
         text_mask, frame_mask, union_mask = text_mask.float(), frame_mask.float(), union_mask.float()
-        last_output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
+        output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
                                     frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union', 
-                                    output_hidden_states=False)['last_hidden_state']
-        text_output, frame_output = last_output[:, :text_mask.shape[1], :], last_output[:, text_mask.shape[1]:, :]
+                                    output_hidden_states=False)
+        text_output, frame_output = output['text_embeddings_cross'], output['frame_embeddings_cross']
         
-        union_pooling = torch.sum(last_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
         text_pooling = torch.sum(text_output * text_mask.unsqueeze(dim=-1), dim=1) / torch.sum(text_mask, dim=-1, keepdim=True)
         frame_pooling = torch.sum(frame_output * frame_mask.unsqueeze(dim=-1), dim=1) / torch.sum(frame_mask, dim=-1, keepdim=True)
-        
-        # features_mean_pooling = torch.sum(features * mask.unsqueeze(dim=-1), dim=1) / torch.sum(mask, dim=-1, keepdim=True)
-        # features_max_pooling, _ = torch.max(features * mask.unsqueeze(dim=-1), dim=1)
-        # features_mean_pooling = features[:, 0, :]
-        # features_mean_pooling = torch.cat([features_mean_pooling, torch.dropout(frame_feature.squeeze(), p=0.1)], dim=-1)
-        
-        
+        union_pooling = torch.cat([text_pooling, frame_pooling], dim=-1)
         
         if not pretrain:
             if self.use_arcface_loss:
-                prediction_lv1 = self.classify_lv1(union_pooling, inputs['label_lv1'])
-                prediction_lv2 = self.classify_lv2(union_pooling, inputs['label'])
+                text_logits1, text_logits2 = self.text_classify(text_pooling)  
+                frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
+                union_logits1, union_logits2 = self.union_classify(union_pooling)
             else:
                 text_logits1, text_logits2 = self.text_classify(text_pooling)  
                 frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
@@ -296,6 +278,9 @@ class UniBert(BertPreTrainedModel):
         # self.video_fc2 = torch.nn.Linear(config.hidden_size, config.hidden_size)
         # self.video_embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
+        frame_config = copy.deepcopy(config)
+        frame_config.num_hidden_layers = 3
+        self.frame_encoder = BertEncoder(frame_config)
         self.cls_token_id = None
 
         self.init_weights()
@@ -317,117 +302,57 @@ class UniBert(BertPreTrainedModel):
     def forward(self, input_ids=None, mask=None, token_type_ids=None, gather_index=None, inputs_embeds=None, modal_type='text', frame_mask=None, 
                 frame_token_type_ids=None, output_hidden_states=True):
 
+        # 各自模态单独编码
         frame_embeddings = self.embeddings(inputs_embeds=inputs_embeds, token_type_ids=frame_token_type_ids)
+        frame_mask_extend = self.get_extended_mask(frame_mask)
+        output_embeddings_frame = self.frame_encoder(frame_embeddings, frame_mask_extend )['last_hidden_state']
+        
         text_embeddings = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
-        embedding_output = torch.cat([text_embeddings, frame_embeddings], dim=1)
+        text_mask_extend = self.get_extended_mask(mask)
+        output_embeddings_text = self.encoder(text_embeddings, text_mask_extend, start_layer=0, end_layer=6)['last_hidden_state']
         
-        seq_length = embedding_output.size()[1]
-        # cross modal mask
-        cross_mask = torch.cat([mask, frame_mask], dim=1) 
-        cross_mask = cross_mask[:, None, None, :]   # [batch_size, head_num, from_seq_length, to_seq_length]
-        cross_mask = ((1.0 - cross_mask) * -1000000.0).float()
+        # cross attention
+        output_embeddings_cross_frame = self.encoder(frame_embeddings, frame_mask_extend, encoder_hidden_states=text_embeddings, 
+                                                     encoder_attention_mask=text_mask_extend, start_layer=6, end_layer=12)['last_hidden_state']
+        output_embeddings_cross_text = self.encoder(text_embeddings, text_mask_extend, encoder_hidden_states=frame_embeddings,
+                                                     encoder_attention_mask=frame_mask_extend, start_layer=6, end_layer=12)['last_hidden_state']
 
-        # # single modal mask  文本对文本  图片对图片
-        # text_mask = torch.cat([mask, torch.zeros_like(frame_mask)], dim=-1)[:, None, None, :]
-        # text_mask = ((1.0 - text_mask) * -1000000.0).float()
-        # text_mask = text_mask.expand(-1, -1, seq_length, -1)[..., :mask.shape[0], :]
-
-        # frame_mask = torch.cat([torch.zeros_like(mask), frame_mask], dim=-1)[:, None, None, :]
-        # frame_mask = ((1.0 - frame_mask) * -1000000.0).float()
-        # frame_mask = frame_mask.expand(-1, -1, seq_length, -1)[..., mask.shape[0]:, :]
-
-        # single_mask = torch.cat([text_mask, frame_mask], dim=2)
-        
-        encoder_outputs = self.encoder(embedding_output, attention_mask=cross_mask, output_hidden_states=output_hidden_states)
-        return encoder_outputs
-
-class NeXtVLAD(nn.Module):
-    def __init__(self, feature_size, cluster_size, config, output_size=1024, expansion=2, groups=8, dropout=0.1):
-        super().__init__()
-        self.feature_size = feature_size
-        self.expansion_size = expansion
-        self.output_size = output_size
-        self.cluster_size = cluster_size
-        self.groups = groups
-        self.drop_rate = dropout
-        
-        self.new_feature_size = self.expansion_size * self.feature_size // self.groups
-        
-        self.dropout = torch.nn.Dropout(self.drop_rate)
-        self.expansion_linear = torch.nn.Linear(self.feature_size, self.expansion_size * self.feature_size)
-        self.group_attention = torch.nn.Linear(self.expansion_size * self.feature_size, self.groups)
-        self.cluster_linear = torch.nn.Linear(self.expansion_size * self.feature_size, self.groups * self.cluster_size,
-                                              bias=False)
-        self.cluster_weight = torch.nn.Parameter(
-            torch.nn.init.normal_(torch.rand(1, self.new_feature_size, self.cluster_size), std=0.01))
-        self.fc = nn.Linear(self.cluster_size * self.new_feature_size, self.output_size)
-        # self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-    def forward(self, inputs, mask=None):
-        # todo mask
-        inputs = self.expansion_linear(inputs)
-        attention = self.group_attention(inputs)
-        attention = torch.sigmoid(attention)
-        attention = attention.reshape([-1, inputs.size(1) * self.groups, 1])
-        reshaped_input = inputs.reshape([-1, self.expansion_size * self.feature_size])
-        activation = self.cluster_linear(reshaped_input)
-        activation = activation.reshape([-1, inputs.size(1) * self.groups, self.cluster_size])
-        activation = torch.softmax(activation, dim=-1)
-        activation = activation * attention
-        a_sum = activation.sum(-2, keepdim=True)
-        a = a_sum * self.cluster_weight
-        activation = activation.permute(0, 2, 1).contiguous()
-        reshaped_input = inputs.reshape([-1, inputs.shape[1] * self.groups, self.new_feature_size])
-        vlad = torch.matmul(activation, reshaped_input)
-        vlad = vlad.permute(0, 2, 1).contiguous()
-        vlad = F.normalize(vlad - a, p=2, dim=1)
-        vlad = vlad.reshape([-1, 1, self.cluster_size * self.new_feature_size])
-        vlad = self.fc(vlad)
-        return vlad
+        output = dict(
+            frame_embeddings=output_embeddings_frame, 
+            text_embeddings=output_embeddings_text,
+            frame_embeddings_cross=output_embeddings_cross_frame,
+            text_embeddings_cross=output_embeddings_cross_text
+        )
+        return output
+    
+    def get_extended_mask(self, mask):
+        mask = mask[:, None, None, :]
+        mask = ((1.0 - mask) * -1000000.0).float()
+        return mask
     
 class Classify(nn.Module):
-    def __init__(self, prior_lv1, prior_lv2, name='') -> None:
+    def __init__(self, in_features, name='', use_arcface_loss=False) -> None:
         super().__init__()
         self.name = name
-        self.fc1 = torch.nn.Linear(768, 23)
-        self.fc2 = torch.nn.Linear(768, 200)
-        self.prior_lv1 = prior_lv1
-        self.prior_lv2 = prior_lv2
+        self.use_arcface_loss=use_arcface_loss
+        if use_arcface_loss:
+            self.fc1 = ArcFace(in_features, 23, s=20, m=0.2)
+            self.fc2 = ArcFace(in_features, 200, s=20, m=0.1)
+        else:
+            self.fc1 = torch.nn.Linear(in_features, 23)
+            self.fc2 = torch.nn.Linear(in_features, 200)
+            
+        prior_lv1, prior_lv2 = get_prior_lv1_lv2()
+        prior_lv1, prior_lv2 = torch.tensor(prior_lv1, device='cuda', dtype=torch.float), torch.tensor(prior_lv2, device='cuda', dtype=torch.float)
+        self.register_buffer('prior_lv1', prior_lv1)
+        self.register_buffer('prior_lv2', prior_lv2)
         
-    def forward(self, input):
-        logits1 = self.fc1(input) + self.prior_lv1.unsqueeze(dim=0)
-        logits2 = self.fc2(input) + self.prior_lv2.unsqueeze(dim=0)
+    def forward(self, input, label1=None, label2=None):
+        if self.use_arcface_loss:
+            logits1 = self.fc1(input, label1) + self.prior_lv1.unsqueeze(dim=0)
+            logits2 = self.fc2(input, label2) + self.prior_lv2.unsqueeze(dim=0)
+        else:
+            logits1 = self.fc1(input) + self.prior_lv1.unsqueeze(dim=0)
+            logits2 = self.fc2(input) + self.prior_lv2.unsqueeze(dim=0)
         return logits1, logits2
 
-
-class SENet(nn.Module):
-    def __init__(self, channels, ratio=8):
-        super().__init__()
-        self.sequeeze = nn.Linear(in_features=channels, out_features=channels // ratio, bias=False)
-        self.relu = nn.ReLU()
-        self.excitation = nn.Linear(in_features=channels // ratio, out_features=channels, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        gates = self.sequeeze(x)
-        gates = self.relu(gates)
-        gates = self.excitation(gates)
-        gates = self.sigmoid(gates)
-        x = torch.mul(x, gates)
-
-        return x
-    
-class ConcatDenseSE(nn.Module):
-    def __init__(self, multimodal_hidden_size, hidden_size, se_ratio, dropout):
-        super().__init__()
-        self.fusion = nn.Linear(multimodal_hidden_size, hidden_size)
-        self.fusion_dropout = nn.Dropout(dropout)
-        self.enhance = SENet(channels=hidden_size, ratio=se_ratio)
-
-    def forward(self, inputs):
-        embeddings = torch.cat(inputs, dim=1)
-        embeddings = self.fusion_dropout(embeddings)
-        embedding = torch.relu(self.fusion(embeddings))
-        embedding = self.enhance(embedding)
-
-        return embedding

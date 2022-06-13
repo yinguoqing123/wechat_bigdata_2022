@@ -555,17 +555,16 @@ class BertEncoder(nn.Module):
         output_attentions: Optional[bool] = False,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
-        single_mask: Optional[torch.FloatTensor] = None,
+        start_layer: int = 0,
+        end_layer: int = 12
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
          
         next_decoder_cache = () if use_cache else None
-        for i, layer_module in enumerate(self.layer):
-            # if i < 6:
-            #     attention_mask = single_mask
-                
+        for i, layer_module in zip(list(range(start_layer, end_layer)), self.layer):
+    
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
