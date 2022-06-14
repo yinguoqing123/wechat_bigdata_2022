@@ -98,10 +98,10 @@ class Classify(nn.Module):
         self.register_buffer('prior_lv1', prior_lv1)
         self.register_buffer('prior_lv2', prior_lv2)
         
-    def forward(self, input, label=None):
+    def forward(self, input, label1=None, label2=None):
         if self.use_arcface:
-            logits1 = self.fc1(input, label) + self.prior_lv1.unsqueeze(dim=0)
-            logits2 = self.fc2(input, label) + self.prior_lv2.unsqueeze(dim=0)
+            logits1 = self.fc1(input, label1) + self.prior_lv1.unsqueeze(dim=0)
+            logits2 = self.fc2(input, label2) + self.prior_lv2.unsqueeze(dim=0)
         else:
             logits1 = self.fc1(input) + self.prior_lv1.unsqueeze(dim=0)
             logits2 = self.fc2(input) + self.prior_lv2.unsqueeze(dim=0)

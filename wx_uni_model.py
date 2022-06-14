@@ -27,9 +27,9 @@ class WXUniModel(nn.Module):
         
         self.use_arcface_loss = use_arcface_loss
 
-        self.text_classify = Classify(768, name='text', use_arcface_loss=False)
-        self.frame_classify = Classify(768, name='frame', use_arcface_loss=False)
-        self.union_classify = Classify(768*2, name='union', use_arcface_loss=False)
+        self.text_classify = Classify(768, name='text', use_arcface_loss=use_arcface_loss)
+        self.frame_classify = Classify(768, name='frame', use_arcface_loss=use_arcface_loss)
+        self.union_classify = Classify(768, name='union', use_arcface_loss=use_arcface_loss)
 
     
         self.task = set(task)
@@ -57,8 +57,8 @@ class WXUniModel(nn.Module):
         frame_feature, frame_mask, frame_token_type_ids = inputs['frame_input'], inputs['frame_mask'], inputs['frame_token_type_ids']
         text_input_ids, text_mask, text_token_type_ids = inputs['text_input'], inputs['text_mask'], inputs['text_token_type_ids']
             
-        # frame mlp
-        frame_feature = self.frame_fc(frame_feature)
+        # # frame mlp
+        # frame_feature = self.frame_fc(frame_feature)
         
         if task is None:
             sample_task = self.task
@@ -92,17 +92,17 @@ class WXUniModel(nn.Module):
         output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
                                     frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union', 
                                     output_hidden_states=False)
-        text_output, frame_output = output['text_embeddings_cross'], output['frame_embeddings_cross']
+        text_output, frame_output, union_output = output['text_embeddings'], output['frame_embeddings'], output['union_embeddings']
         
         text_pooling = torch.sum(text_output * text_mask.unsqueeze(dim=-1), dim=1) / torch.sum(text_mask, dim=-1, keepdim=True)
         frame_pooling = torch.sum(frame_output * frame_mask.unsqueeze(dim=-1), dim=1) / torch.sum(frame_mask, dim=-1, keepdim=True)
-        union_pooling = torch.cat([text_pooling, frame_pooling], dim=-1)
+        union_pooling = torch.torch.sum(union_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
         
         if not pretrain:
             if self.use_arcface_loss:
-                text_logits1, text_logits2 = self.text_classify(text_pooling)  
-                frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
-                union_logits1, union_logits2 = self.union_classify(union_pooling)
+                text_logits1, text_logits2 = self.text_classify(text_pooling, inputs['label_lv1'], inputs['label'])  
+                frame_logits1, frame_logits2 = self.frame_classify(frame_pooling, inputs['label_lv1'], inputs['label'])  
+                union_logits1, union_logits2 = self.union_classify(union_pooling, inputs['label_lv1'], inputs['label'])
             else:
                 text_logits1, text_logits2 = self.text_classify(text_pooling)  
                 frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
@@ -309,19 +309,17 @@ class UniBert(BertPreTrainedModel):
         
         text_embeddings = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         text_mask_extend = self.get_extended_mask(mask)
-        output_embeddings_text = self.encoder(text_embeddings, text_mask_extend, start_layer=0, end_layer=6)['last_hidden_state']
+        output_embeddings_text = self.encoder(text_embeddings, text_mask_extend, start_layer=0, end_layer=12)['last_hidden_state']
         
-        # cross attention
-        output_embeddings_cross_frame = self.encoder(frame_embeddings, frame_mask_extend, encoder_hidden_states=text_embeddings, 
-                                                     encoder_attention_mask=text_mask_extend, start_layer=6, end_layer=12)['last_hidden_state']
-        output_embeddings_cross_text = self.encoder(text_embeddings, text_mask_extend, encoder_hidden_states=frame_embeddings,
-                                                     encoder_attention_mask=frame_mask_extend, start_layer=6, end_layer=12)['last_hidden_state']
+        #union bert
+        union_embeddings = torch.cat([output_embeddings_text, output_embeddings_frame], dim=1)
+        union_mask_extend = self.get_extended_mask(torch.cat([mask, frame_mask], dim=-1))
+        output_embeddings_union = self.encoder(union_embeddings, union_mask_extend, start_layer=0, end_layer=12)['last_hidden_state']
 
         output = dict(
             frame_embeddings=output_embeddings_frame, 
             text_embeddings=output_embeddings_text,
-            frame_embeddings_cross=output_embeddings_cross_frame,
-            text_embeddings_cross=output_embeddings_cross_text
+            union_embeddings=output_embeddings_union,
         )
         return output
     

@@ -11,6 +11,8 @@ from wx_uni_model import WXUniModel
 from util import setup_device, setup_seed, setup_logging, build_optimizer, evaluate
 from create_optimizer import create_optimizer, get_reducelr_schedule, get_warmup_schedule
 from util import FGM, EMA
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2, 3"
 
 def validate(model, val_dataloader):
     model.eval()
@@ -42,7 +44,7 @@ def train_and_validate(args):
     train_dataloader, val_dataloader = create_dataloaders(args)
     
     # 2. build model and optimizers
-    model = WXUniModel(args, task=[], use_arcface_loss=False)
+    model = WXUniModel(args, task=[], use_arcface_loss=True)
     fgm = FGM(model)
     ema = EMA(model)
     first_ema_flag = True
@@ -58,7 +60,7 @@ def train_and_validate(args):
     step = 0
     best_score = args.best_score
     start_time = time.time()
-    accumulation_steps = 4
+    accumulation_steps = 1
     num_total_steps = len(train_dataloader) * args.max_epochs
     for epoch in range(args.max_epochs):
         for batch in train_dataloader:
@@ -68,24 +70,24 @@ def train_and_validate(args):
             loss = loss.mean() / accumulation_steps
             accuracy = mix_result['accuracy'].mean()
             loss.backward() 
-            # if step > 3000:
-            #     fgm.attack()
-            #     loss_adv, _, _, mix_result = model(batch)
-            #     accuracy = mix_result['accuracy'].mean()
-            #     loss_adv.backward()
-            #     fgm.restore()
+            if step > 3000:
+                fgm.attack()
+                loss_adv, _, _, mix_result = model(batch)
+                accuracy = mix_result['accuracy'].mean()
+                loss_adv.backward()
+                fgm.restore()
                 
-            # if step > 7000 and first_ema_flag:
-            #     ema.register()
-            #     first_ema_flag = False
+            if step > 3000 and first_ema_flag:
+                ema.register()
+                first_ema_flag = False
             
                 
             if step % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler_warmup.step()
-                # if step > 7000:
-                #     ema.update()
+                if step > 3000:
+                    ema.update()
                 
             if step % args.print_steps == 0:
                 time_per_step = (time.time() - start_time) / max(1, step)
@@ -95,8 +97,8 @@ def train_and_validate(args):
                 
             if step % 1000 == 0:
                 # 4. validation
-                # if step > 7000:
-                #     ema.apply_shadow()
+                if step > 3000:
+                    ema.apply_shadow()
                 loss, results = validate(model, val_dataloader)
                 results = {k: round(v, 4) for k, v in results.items()}
                 logging.info(f"Epoch {epoch} step {step}: loss {loss:.3f}, {results}")
@@ -109,8 +111,8 @@ def train_and_validate(args):
                     torch.save({'epoch': epoch, 'model_state_dict': state_dict, 'mean_f1': mean_f1},
                             f'{args.savedmodel_path}/model_best.bin')
                 
-                # if step > 7000:
-                #     ema.restore()
+                if step > 3000:
+                    ema.restore()
                     
                 if step > args.bert_warmup_steps:
                     scheduler_reducelr.step(mean_f1)

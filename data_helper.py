@@ -128,10 +128,12 @@ class MultiModalDataset(Dataset):
         return feat, mask
     
     def tokenize_text(self, text: str) -> tuple:
-        encoded_inputs = self.tokenizer(text, max_length=self.bert_seq_length, padding='max_length', truncation=True)
+        # encoded_inputs = self.tokenizer(text, max_length=self.bert_seq_length, padding='max_length', truncation=True)
+        encoded_inputs = self.tokenizer(text, max_length=256, padding='max_length', truncation=True)
         input_ids = torch.LongTensor(encoded_inputs['input_ids'])
         mask = torch.LongTensor(encoded_inputs['attention_mask'])
-        return input_ids, mask
+        token_type_ids = torch.zeros_like(mask)
+        return input_ids, mask, token_type_ids
     
     def tokenize_text2(self, title: str, ocr_text: str, asr_text: str) -> tuple:
         encoded_titles = self.tokenizer(title, max_length=80, truncation=True, add_special_tokens=False)
@@ -162,13 +164,10 @@ class MultiModalDataset(Dataset):
         # title ocr asr
         title, asr = self.anns[idx]['title'], self.anns[idx]['asr']
         asr = re.sub('嗯{3,}', '', asr)
-        if len(asr) > 128:
-            asr = asr[:80] + ',' + asr[-48:]
         ocr = sorted(self.anns[idx]['ocr'], key = lambda x: x['time'])
         ocr = ','.join([t['text'] for t in ocr])
-        if len(ocr) > 128:
-            ocr = ocr[:80] + ',' + ocr[-48:]
-        text_input, text_mask, text_token_type_ids = self.tokenize_text2(title, ocr, asr)
+        text = title + ',' + ocr[:80] + ',' + asr
+        text_input, text_mask, text_token_type_ids = self.tokenize_text(text)
         frame_input, frame_mask, frame_token_type_ids = self.tokenize_img(idx)
         
         # Step 3, summarize into a dictionary
@@ -225,9 +224,9 @@ def resample(dataset):
     indices_resample = []
     for idx in indices:
         if label_cnt[anns[idx]['category_id']] < 100:
-            indices_resample.extend([idx] * 3)
+            indices_resample.extend([idx] * 5)
         elif label_cnt[anns[idx]['category_id']] < 500:
-            indices_resample.extend([idx] * 2)
+            indices_resample.extend([idx] * 3)
         elif label_cnt[anns[idx]['category_id']] < 1000:
             indices_resample.extend([idx] * 2)
         else:
