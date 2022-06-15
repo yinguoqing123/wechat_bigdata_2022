@@ -69,6 +69,6 @@ def get_warmup_schedule(optimizer, num_warmup_steps=5000):
     
     return LambdaLR(optimizer, lr_lambda)
 
-def get_reducelr_schedule(optimiezer, mode='max', factor=0.7, patience=2):
+def get_reducelr_schedule(optimiezer, mode='max', factor=0.5, patience=1):
     return ReduceLROnPlateau(optimiezer, mode=mode, factor=factor, patience=patience)
 

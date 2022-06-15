@@ -21,16 +21,11 @@ class WXUniPretrainModel(nn.Module):
         super().__init__()
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
-        self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size, bias=False)
+        self.config = uni_bert_cfg
         
         #uni_bert_cfg.num_hidden_layers = 1
         
         self.use_arcface_loss = use_arcface_loss
-
-        self.text_classify = Classify(768, name='text', use_arcface_loss=use_arcface_loss)
-        self.frame_classify = Classify(768, name='frame', use_arcface_loss=use_arcface_loss)
-        self.union_classify = Classify(768, name='union', use_arcface_loss=use_arcface_loss)
-
     
         self.task = set(task)
         
@@ -50,15 +45,12 @@ class WXUniPretrainModel(nn.Module):
         else:
             self.roberta = UniBertForMaskedLM(uni_bert_cfg)
             
-        self.roberta.set_cls_token_id(int(self.tokenizer.cls_token_id))
+        self.roberta.bert.set_cls_token_id(int(self.tokenizer.cls_token_id))
 
     def forward(self, inputs, target=None, task=None, inference=False, pretrain=False):
         loss, pred = 0, None
         frame_feature, frame_mask, frame_token_type_ids = inputs['frame_input'], inputs['frame_mask'], inputs['frame_token_type_ids']
         text_input_ids, text_mask, text_token_type_ids = inputs['text_input'], inputs['text_mask'], inputs['text_token_type_ids']
-            
-        # # frame mlp
-        frame_feature = self.frame_fc(frame_feature)
         
         if task is None:
             sample_task = self.task
@@ -75,16 +67,16 @@ class WXUniPretrainModel(nn.Module):
             lm_label = lm_label.to(text_input_ids.device)
             return_mlm = True
             
+        if 'itm' in sample_task:
+            input_feature, video_text_match_label = self.sv.torch_shuf_video(frame_feature.cpu())
+            frame_feature = input_feature.to(frame_feature.device)
+            video_text_match_label = video_text_match_label.to(frame_feature.device)
+            
         if 'mvm' in sample_task:
             vm_input = frame_feature
             input_feature, video_label = self.vm.torch_mask_frames(frame_feature.cpu(), frame_mask.cpu())
             frame_feature = input_feature.to(frame_feature.device)
             video_label = video_label.to(frame_feature.device)
-            
-        if 'itm' in sample_task:
-            input_feature, video_text_match_label = self.sv.torch_shuf_video(frame_feature.cpu())
-            frame_feature = input_feature.to(frame_feature.device)
-            video_text_match_label = video_text_match_label.to(frame_feature.device)
         
         # 
         union_mask = torch.cat([text_mask, frame_mask], dim=-1)
@@ -95,9 +87,9 @@ class WXUniPretrainModel(nn.Module):
     
         
         if 'mlm' in sample_task:
-            mlm_pred = lm_prediction_scores.contiguous().view(-1, self.vocab_size)
+            mlm_pred = lm_prediction_scores.contiguous().view(-1, self.config.vocab_size)
             mlm_loss = nn.CrossEntropyLoss()(mlm_pred, lm_label.view(-1))
-            mlm_accuracy = torch.sum(mlm_pred==lm_label.view(-1)) / torch.sum(lm_label.view(-1)>0)
+            mlm_accuracy = torch.sum(lm_prediction_scores.argmax(dim=-1).view(-1)==lm_label.view(-1)) / (torch.sum(lm_label.view(-1)>0) + 1e-12)
             # mlm_loss = torch.log(mlm_loss + 1e-12)
             
         if 'mvm' in sample_task:
@@ -109,7 +101,7 @@ class WXUniPretrainModel(nn.Module):
         if 'itm' in sample_task:
             itm_pred = self.newfc_itm(output_embeddings[:, 0, :])
             loss_itm = nn.BCEWithLogitsLoss()(itm_pred.view(-1), video_text_match_label.view(-1))
-            itm_accuracy = torch.sum( (itm_pred.view(-1)>0.5) == video_text_match_label.view(-1) ) / itm_pred.view(-1).shape[0]
+            itm_accuracy = torch.sum( (itm_pred.view(-1)>0.5).int() == video_text_match_label.view(-1).int() ).float() / itm_pred.view(-1).shape[0]
             # loss_itm += torch.log(loss_itm + 1e-12)
          
         return   mlm_loss, loss_itm, mlm_accuracy, itm_accuracy
@@ -139,14 +131,6 @@ class WXUniPretrainModel(nn.Module):
         result = {'loss': loss, 'accuracy': accuracy, 'pred_label_id': pred_label_id, 'label_lv2': label_lv2}
         return result
         
-    
-    @staticmethod
-    def cal_pretrain_metric(loss, mlm_pred, lm_label, itm_pred, itm_label):
-        mlm_pred, itm_pred = mlm_pred.argmax(dim=-1), (itm_pred>0.5).int()
-        mlm_pred, lm_label, itm_pred, item_label = mlm_pred.view(-1), lm_label.view(-1), itm_pred.view(-1), item_label.view(-1)
-        accuracy_mlm = (mlm_pred == lm_label).float().sum() / (lm_label != -100).sum()
-        accuracy_itm = (itm_pred == itm_label).float().sum() / itm_label.shape[0]
-        return loss, accuracy_mlm, accuracy_itm
     
     def calculate_mfm_loss(self, frame_feature_output, frame_feature_input, 
                            frame_mask, video_labels_index, normalize=False, temp=0.1):
@@ -258,10 +242,11 @@ class UniBert(BertPreTrainedModel):
         # self.video_fc2 = torch.nn.Linear(config.hidden_size, config.hidden_size)
         # self.video_embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
-        frame_config = copy.deepcopy(config)
-        frame_config.num_hidden_layers = 3
-        self.frame_encoder = BertEncoder(frame_config)
+        # frame_config = copy.deepcopy(config)
+        # frame_config.num_hidden_layers = 3
+        # self.frame_encoder = BertEncoder(frame_config)
         self.cls_token_id = None
+        self.frame_fc = nn.Linear(768, self.config.hidden_size, bias=False)
 
         self.init_weights()
         
@@ -283,6 +268,7 @@ class UniBert(BertPreTrainedModel):
                 frame_token_type_ids=None, output_hidden_states=True):
 
         # 各自模态单独编码
+        inputs_embeds = self.frame_fc(inputs_embeds)
         frame_embeddings = self.embeddings(inputs_embeds=inputs_embeds, token_type_ids=frame_token_type_ids)
         # frame_mask_extend = self.get_extended_mask(frame_mask)
         # output_embeddings_frame = self.frame_encoder(frame_embeddings, frame_mask_extend )['last_hidden_state']

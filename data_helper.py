@@ -21,6 +21,7 @@ def create_dataloaders(args, pretrain=False):
         size = len(dataset)
         val_size = 10000
         train_dataset, val_dataset = torch.utils.data.dataset.random_split(dataset, [size - val_size, val_size])
+        print(f"train dataset: {len(train_dataset)}")
     else:
         dataset = MultiModalDataset(args, args.train_annotation, args.train_zip_feats)
         size = len(dataset)
