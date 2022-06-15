@@ -46,9 +46,9 @@ class WXUniModel(nn.Module):
             self.newfc_itm = torch.nn.Linear(uni_bert_cfg.hidden_size, 1) 
 
         if init_from_pretrain:
-            self.roberta = UniBert.from_pretrained(args.bert_dir, config=uni_bert_cfg)
+            self.roberta = UniBertForMaskedLM.from_pretrained(args.bert_dir, config=uni_bert_cfg)
         else:
-            self.roberta = UniBert(uni_bert_cfg)
+            self.roberta = UniBertForMaskedLM(uni_bert_cfg)
             
         self.roberta.set_cls_token_id(int(self.tokenizer.cls_token_id))
 
@@ -89,14 +89,14 @@ class WXUniModel(nn.Module):
         # 
         union_mask = torch.cat([text_mask, frame_mask], dim=-1)
         text_mask, frame_mask, union_mask = text_mask.float(), frame_mask.float(), union_mask.float()
-        output = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
+        output, _ = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
                                     frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union', 
                                     output_hidden_states=False)
         text_output, frame_output, union_output = output['text_embeddings'], output['frame_embeddings'], output['union_embeddings']
         
         text_pooling = torch.sum(text_output * text_mask.unsqueeze(dim=-1), dim=1) / torch.sum(text_mask, dim=-1, keepdim=True)
         frame_pooling = torch.sum(frame_output * frame_mask.unsqueeze(dim=-1), dim=1) / torch.sum(frame_mask, dim=-1, keepdim=True)
-        union_pooling = torch.torch.sum(union_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
+        union_pooling = torch.sum(union_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
         
         if not pretrain:
             if self.use_arcface_loss:
@@ -254,10 +254,11 @@ class VisualOnlyMLMHead(nn.Module):
         return prediction_scores
     
 class UniBertForMaskedLM(BertPreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config, cls_head=False):
         super().__init__(config)
         self.bert = UniBert(config)
-        self.cls = BertOnlyMLMHead(config)
+        if cls_head:
+            self.cls = BertOnlyMLMHead(config)
         
     # Copied from transformers.models.bert.modeling_bert.BertModel.forward
     def forward(self, inputs, gather_index=None, return_mlm=False):
@@ -304,15 +305,17 @@ class UniBert(BertPreTrainedModel):
 
         # 各自模态单独编码
         frame_embeddings = self.embeddings(inputs_embeds=inputs_embeds, token_type_ids=frame_token_type_ids)
+        cls_embeddings = self.embeddings(torch.tensor(self.cls_token_id)).expand(frame_mask.shape[0], 1, -1)
+        frame_embeddings_new = torch.cat([cls_embeddings, frame_embeddings], dim=1)
         frame_mask_extend = self.get_extended_mask(frame_mask)
-        output_embeddings_frame = self.frame_encoder(frame_embeddings, frame_mask_extend )['last_hidden_state']
+        output_embeddings_frame = self.frame_encoder(frame_embeddings_new, frame_mask_extend )['last_hidden_state']
         
         text_embeddings = self.embeddings(input_ids=input_ids, token_type_ids=token_type_ids)
         text_mask_extend = self.get_extended_mask(mask)
         output_embeddings_text = self.encoder(text_embeddings, text_mask_extend, start_layer=0, end_layer=12)['last_hidden_state']
         
         #union bert
-        union_embeddings = torch.cat([output_embeddings_text, output_embeddings_frame], dim=1)
+        union_embeddings = torch.cat([text_embeddings, frame_embeddings], dim=1)
         union_mask_extend = self.get_extended_mask(torch.cat([mask, frame_mask], dim=-1))
         output_embeddings_union = self.encoder(union_embeddings, union_mask_extend, start_layer=0, end_layer=12)['last_hidden_state']
 
@@ -353,4 +356,3 @@ class Classify(nn.Module):
             logits1 = self.fc1(input) + self.prior_lv1.unsqueeze(dim=0)
             logits2 = self.fc2(input) + self.prior_lv2.unsqueeze(dim=0)
         return logits1, logits2
-

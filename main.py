@@ -10,6 +10,7 @@ from model import MultiModal
 from wx_uni_model import WXUniModel
 from util import setup_device, setup_seed, setup_logging, build_optimizer, evaluate
 from create_optimizer import create_optimizer, get_reducelr_schedule, get_warmup_schedule
+from transformers import get_cosine_schedule_with_warmup
 from util import FGM, EMA
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2, 3"
@@ -52,6 +53,7 @@ def train_and_validate(args):
     optimizer = create_optimizer(model)
     scheduler_warmup = get_warmup_schedule(optimizer, num_warmup_steps=args.bert_warmup_steps)
     scheduler_reducelr = get_reducelr_schedule(optimizer, patience=1)
+    # schedule_cosine = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=3000 * 5)
     if args.device == 'cuda':
         model = torch.nn.parallel.DataParallel(model.to(args.device))
         # model = model.to(args.device)

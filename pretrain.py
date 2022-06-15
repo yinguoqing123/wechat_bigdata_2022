@@ -20,7 +20,7 @@ def validate(model, val_dataloader):
     mlm_losses, itm_losses = [], []
     with torch.no_grad():
         for batch in val_dataloader:
-            mlm_loss, itm_loss, _, _ = model(batch)
+            mlm_loss, itm_loss, _, _, vm_loss = model(batch)
             mlm_losses.append(mlm_loss.mean().to('cpu').item())
             itm_losses.append(itm_loss.mean().to('cpu').itm())
             
@@ -51,12 +51,13 @@ def pretrain(args):
         for batch in train_dataloader:
             step += 1
             model.train()
-            mlm_loss, itm_loss, mlm_accuracy, itm_accuracy = model(batch)
+            mlm_loss, itm_loss, mlm_accuracy, itm_accuracy, vm_loss = model(batch)
             mlm_loss = mlm_loss.mean() / accumulation_steps
             itm_loss = itm_loss.mean() / accumulation_steps
+            vm_loss = vm_loss.mean() / accumulation_steps
             mlm_accuracy = mlm_accuracy.mean()
             itm_accuracy = itm_accuracy.mean()
-            loss = mlm_loss + itm_loss
+            loss = mlm_loss + itm_loss + vm_loss
             loss.backward() 
                 
             if step % accumulation_steps == 0:

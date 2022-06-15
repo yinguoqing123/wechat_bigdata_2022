@@ -96,7 +96,8 @@ class WXUniPretrainModel(nn.Module):
             vm_output = self.roberta_mvm_lm_header(frame_feature)
             masked_vm_loss = self.calculate_mfm_loss(vm_output, vm_input, 
                                                      frame_mask, video_label, normalize=False)
-            loss += masked_vm_loss / 3 / len(sample_task)
+        else:
+            masked_vm_loss = torch.tensor(0, device='cuda')
             
         if 'itm' in sample_task:
             itm_pred = self.newfc_itm(output_embeddings[:, 0, :])
@@ -104,7 +105,7 @@ class WXUniPretrainModel(nn.Module):
             itm_accuracy = torch.sum( (itm_pred.view(-1)>0.5).int() == video_text_match_label.view(-1).int() ).float() / itm_pred.view(-1).shape[0]
             # loss_itm += torch.log(loss_itm + 1e-12)
          
-        return   mlm_loss, loss_itm, mlm_accuracy, itm_accuracy
+        return   mlm_loss, loss_itm, mlm_accuracy, itm_accuracy, masked_vm_loss
     
     @staticmethod
     def cal_loss(prediction_lv1, prediction_lv2, label_lv1, label_lv2, focal_loss=False):
