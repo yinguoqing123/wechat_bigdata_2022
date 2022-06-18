@@ -36,7 +36,9 @@ def pretrain(args):
     model = WXUniPretrainModel(args, use_arcface_loss=False)
     # optimizer, scheduler = build_optimizer(args, model)
     optimizer = create_optimizer(model)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=20000 * 5)
+    scheduler_warmup = get_warmup_schedule(optimizer, num_warmup_steps=args.warmup_steps)
+    scheduler_reducelr = get_reducelr_schedule(optimizer, patience=1, factor=0.6)
+    # scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=20000 * 5)
     if args.device == 'cuda':
         model = torch.nn.parallel.DataParallel(model.to(args.device))
         # model = model.to(args.device)
@@ -63,7 +65,9 @@ def pretrain(args):
             if step % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler.step()
+                if step < args.warmup_steps:
+                    scheduler_warmup.step()
+                # scheduler.step()
                 
             if step % args.print_steps == 0:
                 time_per_step = (time.time() - start_time) / max(1, step)
@@ -80,7 +84,12 @@ def pretrain(args):
             if step % 3000 == 0:
                 # 5. save checkpoint
                 val_loss = validate(model, val_dataloader)
+                if step > args.warmup_steps:
+                    scheduler_reducelr.step(val_loss)
+                    
                 if val_loss < loss_min:
+                    loss_min = val_loss
+                    logging.info(f"val loss: {val_loss:.3f} step {step} lr {optimizer.param_groups[0]['lr']} {optimizer.param_groups[-1]['lr']}")
                     print(f"正在保存模型, val loss: {val_loss}")
                     state_dict = model.module.state_dict() if args.device == 'cuda' else model.state_dict()
                     torch.save({'step': step, 'model_state_dict': state_dict, 'mlm_loss': mlm_loss, 'itm_loss': itm_loss},

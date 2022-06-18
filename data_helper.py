@@ -21,7 +21,6 @@ def create_dataloaders(args, pretrain=False):
         size = len(dataset)
         val_size = 10000
         train_dataset, val_dataset = torch.utils.data.dataset.random_split(dataset, [size - val_size, val_size])
-        print(f"train dataset: {len(train_dataset)}")
     else:
         dataset = MultiModalDataset(args, args.train_annotation, args.train_zip_feats)
         size = len(dataset)
@@ -129,12 +128,10 @@ class MultiModalDataset(Dataset):
         return feat, mask
     
     def tokenize_text(self, text: str) -> tuple:
-        # encoded_inputs = self.tokenizer(text, max_length=self.bert_seq_length, padding='max_length', truncation=True)
-        encoded_inputs = self.tokenizer(text, max_length=256, padding='max_length', truncation=True)
+        encoded_inputs = self.tokenizer(text, max_length=self.bert_seq_length, padding='max_length', truncation=True)
         input_ids = torch.LongTensor(encoded_inputs['input_ids'])
         mask = torch.LongTensor(encoded_inputs['attention_mask'])
-        token_type_ids = torch.zeros_like(mask)
-        return input_ids, mask, token_type_ids
+        return input_ids, mask
     
     def tokenize_text2(self, title: str, ocr_text: str, asr_text: str) -> tuple:
         encoded_titles = self.tokenizer(title, max_length=80, truncation=True, add_special_tokens=False)
@@ -165,10 +162,13 @@ class MultiModalDataset(Dataset):
         # title ocr asr
         title, asr = self.anns[idx]['title'], self.anns[idx]['asr']
         asr = re.sub('嗯{3,}', '', asr)
+        if len(asr) > 128:
+            asr = asr[:64] + ',' + asr[-64:]
         ocr = sorted(self.anns[idx]['ocr'], key = lambda x: x['time'])
         ocr = ','.join([t['text'] for t in ocr])
-        text = title + ',' + ocr[:80] + ',' + asr
-        text_input, text_mask, text_token_type_ids = self.tokenize_text(text)
+        if len(ocr) > 128:
+            ocr = ocr[:64] + ',' + ocr[-64:]
+        text_input, text_mask, text_token_type_ids = self.tokenize_text2(title, ocr, asr)
         frame_input, frame_mask, frame_token_type_ids = self.tokenize_img(idx)
         
         # Step 3, summarize into a dictionary

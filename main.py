@@ -45,13 +45,14 @@ def train_and_validate(args):
     train_dataloader, val_dataloader = create_dataloaders(args)
     
     # 2. build model and optimizers
-    model = WXUniModel(args, task=[], use_arcface_loss=True)
+    model = WXUniModel(args, task=[], use_arcface_loss=False)
+    model.load_state_dict(torch.load('../save/v1/model_pretrain_best.bin')['model_state_dict'], strict=False)
     fgm = FGM(model)
     ema = EMA(model)
     first_ema_flag = True
     # optimizer, scheduler = build_optimizer(args, model)
     optimizer = create_optimizer(model)
-    scheduler_warmup = get_warmup_schedule(optimizer, num_warmup_steps=args.bert_warmup_steps)
+    scheduler_warmup = get_warmup_schedule(optimizer, num_warmup_steps=args.warmup_steps)
     scheduler_reducelr = get_reducelr_schedule(optimizer, patience=1)
     # schedule_cosine = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=3000 * 5)
     if args.device == 'cuda':
@@ -87,7 +88,8 @@ def train_and_validate(args):
             if step % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler_warmup.step()
+                if step < args.warmup_steps:
+                    scheduler_warmup.step()
                 if step > 3000:
                     ema.update()
                 
@@ -116,7 +118,7 @@ def train_and_validate(args):
                 if step > 3000:
                     ema.restore()
                     
-                if step > args.bert_warmup_steps:
+                if step > args.warmup_steps:
                     scheduler_reducelr.step(mean_f1)
                     
 
