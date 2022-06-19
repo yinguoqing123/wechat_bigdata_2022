@@ -17,7 +17,7 @@ from data_helper import get_prior_lv1_lv2
 from util import ArcFace, FocalLoss
 
 class WXUniPretrainModel(nn.Module):
-    def __init__(self, args, task=['mlm', 'itm'], init_from_pretrain=True, use_arcface_loss=False):
+    def __init__(self, args, task=['mlm', 'itm', 'mfm'], init_from_pretrain=True, use_arcface_loss=False):
         super().__init__()
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
@@ -32,7 +32,7 @@ class WXUniPretrainModel(nn.Module):
         if 'mlm' in task:
             self.lm = MaskLM(tokenizer_path=args.bert_dir)
         
-        if 'mvm' in task:
+        if 'mfm' in task:
             self.vm = MaskVideo()
             self.roberta_mvm_lm_header = VisualOnlyMLMHead(uni_bert_cfg) 
             
@@ -72,7 +72,7 @@ class WXUniPretrainModel(nn.Module):
             frame_feature = input_feature.to(frame_feature.device)
             video_text_match_label = video_text_match_label.to(frame_feature.device)
             
-        if 'mvm' in sample_task:
+        if 'mfm' in sample_task:
             vm_input = frame_feature
             input_feature, video_label = self.vm.torch_mask_frames(frame_feature.cpu(), frame_mask.cpu())
             frame_feature = input_feature.to(frame_feature.device)
@@ -92,8 +92,8 @@ class WXUniPretrainModel(nn.Module):
             mlm_accuracy = torch.sum(lm_prediction_scores.argmax(dim=-1).view(-1)==lm_label.view(-1)) / (torch.sum(lm_label.view(-1)>0) + 1e-12)
             # mlm_loss = torch.log(mlm_loss + 1e-12)
             
-        if 'mvm' in sample_task:
-            vm_output = self.roberta_mvm_lm_header(frame_feature)
+        if 'mfm' in sample_task:
+            vm_output = self.roberta_mvm_lm_header(output_embeddings[:, text_mask.shape[1]:, :])
             masked_vm_loss = self.calculate_mfm_loss(vm_output, vm_input, 
                                                      frame_mask, video_label, normalize=False)
         else:
