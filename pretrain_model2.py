@@ -14,24 +14,32 @@ from masklm import MaskLM, MaskVideo, ShuffleVideo
 from transformers import AutoTokenizer
 from modeling_bert import *
 from data_helper import get_prior_lv1_lv2
-from util import ArcFace, FocalLoss 
+from util import ArcFace, FocalLoss
 
-class WXUniModel(nn.Module):
-    def __init__(self, args, task=[], init_from_pretrain=True, use_arcface_loss=False):
+class WXUniPretrainModel(nn.Module):
+    def __init__(self, args, task=['mlm', 'itm'], init_from_pretrain=True, use_arcface_loss=False):
         super().__init__()
         uni_bert_cfg = BertConfig.from_pretrained(args.bert_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(args.bert_dir)
-        # self.frame_fc = nn.Linear(768, uni_bert_cfg.hidden_size, bias=False)
+        self.config = uni_bert_cfg
         
         #uni_bert_cfg.num_hidden_layers = 1
         
         self.use_arcface_loss = use_arcface_loss
-
-        self.text_classify = Classify(768, name='text', use_arcface_loss=use_arcface_loss)
-        self.frame_classify = Classify(768, name='frame', use_arcface_loss=use_arcface_loss)
-        # self.union_classify = Classify(768*2, name='union', use_arcface_loss=use_arcface_loss)
-        # self.mid_text_classify = Classify(768, name='text_mid', use_arcface_loss=use_arcface_loss)
-        # self.mid_frame_classify = Classify(768, name='text_mid', use_arcface_loss=use_arcface_loss)
+    
+        self.task = set(task)
+        
+        if 'mlm' in task:
+            self.lm = MaskLM(tokenizer_path=args.bert_dir)
+        
+        if 'mvm' in task:
+            self.vm = MaskVideo()
+            self.roberta_mvm_lm_header = VisualOnlyMLMHead(uni_bert_cfg) 
+            
+        if 'itm' in task:
+            self.sv = ShuffleVideo()
+            self.newfc_itm_text_cls = torch.nn.Linear(uni_bert_cfg.hidden_size, 1) 
+            self.newfc_itm_frame_cls = torch.nn.Linear(uni_bert_cfg.hidden_size, 1) 
 
         if init_from_pretrain:
             self.roberta = UniBertForMaskedLM.from_pretrained(args.bert_dir, config=uni_bert_cfg)
@@ -44,53 +52,76 @@ class WXUniModel(nn.Module):
         loss, pred = 0, None
         frame_feature, frame_mask, frame_token_type_ids = inputs['frame_input'], inputs['frame_mask'], inputs['frame_token_type_ids']
         text_input_ids, text_mask, text_token_type_ids = inputs['text_input'], inputs['text_mask'], inputs['text_token_type_ids']
+        
+        if task is None:
+            sample_task = self.task
+        elif type(task) == str:
+            sample_task = [task]
+        elif type(task) == list:
+            sample_task = task
+        
+        # # perprocess
+        return_mlm = False
+        if 'mlm' in sample_task:
+            input_ids, lm_label = self.lm.torch_mask_tokens(text_input_ids.cpu())
+            text_input_ids = input_ids.to(text_input_ids.device)
+            lm_label = lm_label.to(text_input_ids.device)
+            return_mlm = True
             
+        if 'itm' in sample_task:
+            input_feature, video_text_match_label = self.sv.torch_shuf_video(frame_feature.cpu())
+            frame_feature = input_feature.to(frame_feature.device)
+            video_text_match_label = video_text_match_label.to(frame_feature.device)
+            
+        if 'mvm' in sample_task:
+            vm_input = frame_feature
+            input_feature, video_label = self.vm.torch_mask_frames(frame_feature.cpu(), frame_mask.cpu())
+            frame_feature = input_feature.to(frame_feature.device)
+            video_label = video_label.to(frame_feature.device)
+        
+        # 
         union_mask = torch.cat([text_mask, frame_mask], dim=-1)
         text_mask, frame_mask, union_mask = text_mask.float(), frame_mask.float(), union_mask.float()
-        output, _ = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
+        output_embeddings, lm_prediction_scores = self.roberta(text_input_ids, text_mask, text_token_type_ids, frame_token_type_ids=frame_token_type_ids, 
                                     frame_mask=frame_mask, inputs_embeds=frame_feature, modal_type='union', 
-                                    output_hidden_states=False)
-        text_output, frame_output, union_output = output['text_embeddings'], output['frame_embeddings'], output['union_embeddings']
+                                    output_hidden_states=False, return_mlm=return_mlm)
         
-        # text_mid_output, frame_mid_output = output['mid_frame_embeddings'], output['mid_text_embeddings']
-        # text_pooling = torch.sum(text_output * text_mask.unsqueeze(dim=-1), dim=1) / torch.sum(text_mask, dim=-1, keepdim=True)
-        # frame_pooling = torch.sum(frame_output * frame_mask.unsqueeze(dim=-1), dim=1) / torch.sum(frame_mask, dim=-1, keepdim=True)
-        # union_pooling = torch.sum(union_output * union_mask.unsqueeze(dim=-1), dim=1) / torch.sum(union_mask, dim=-1, keepdim=True)
-        text_pooling = text_output[:, 0, :]
-        frame_pooling = frame_output[:, 0, :]
-        # text_mid_pooling = text_mid_output[:, 0, :]
-        # frame_mid_pooling = frame_mid_output[:, 0, :]
-        union_pooling = torch.cat([text_pooling, frame_pooling], dim=-1)
+        # 带cls拼接的
+        output_frame_embeddings, output_text_embeddings = output_embeddings['frame_embeddings'], output_embeddings['text_embeddings']
+        text_embeddings_mid,  frame_embeddings_mid = output_embeddings['mid_text_embeddings'], output_embeddings['mid_frame_embeddings']
         
-        text_pooling_single, frame_pooling_single = output['single_text_mid_output_embeddings'][:, 0, :], output['single_frame_mid_output_embeddings'][:, 0, :]
-        batch_score = torch.matmul(F.normalize(text_pooling_single, dim=-1), F.normalize(frame_pooling_single, dim=-1).t())
-        pos_score = torch.diag(batch_score)
-        batch_score = (batch_score - pos_score.unsqueeze(dim=-1)) * 10
-        itc_loss = torch.logsumexp(batch_score, dim=-1).mean()
+        # 对比损失
+        if 'itc' in sample_task:
+            # 只取一半， 另一半当itm任务存在时，是打乱的 
+            text_embeddings_mid_norm, frame_embeddings_mid_norm = F.normalize(text_embeddings_mid[:, 0, :], dim=-1), F.normalize(frame_embeddings_mid[:, 0, :], dim=-1),
+            bs = text_mask.shape[0] // 2
+            sim_text_frame = torch.matmul(text_embeddings_mid_norm[:bs], frame_embeddings_mid_norm[:bs].t()) * 10  # (bsz, bsz)
+            labels = torch.eye(bs)
+            itc_loss = (torch.log_softmax(sim_text_frame, dim=-1) * labels).sum() / bs
         
-        if self.use_arcface_loss:
-            text_logits1, text_logits2 = self.text_classify(text_pooling, inputs['label_lv1'], inputs['label'])  
-            frame_logits1, frame_logits2 = self.frame_classify(frame_pooling, inputs['label_lv1'], inputs['label'])  
-            # union_logits1, union_logits2 = self.union_classify(union_pooling, inputs['label_lv1'], inputs['label'])
+        if 'mlm' in sample_task:
+            mlm_pred = lm_prediction_scores.contiguous().view(-1, self.config.vocab_size)
+            mlm_loss = nn.CrossEntropyLoss()(mlm_pred, lm_label.view(-1))
+            mlm_accuracy = torch.sum(lm_prediction_scores.argmax(dim=-1).view(-1)==lm_label.view(-1)) / (torch.sum(lm_label.view(-1)>0) + 1e-12)
+            # mlm_loss = torch.log(mlm_loss + 1e-12)
+            
+        if 'mvm' in sample_task:
+            vm_output = self.roberta_mvm_lm_header(output_frame_embeddings[:, 1:, :])
+            masked_vm_loss = self.calculate_mfm_loss(vm_output, vm_input, 
+                                                     frame_mask, video_label, normalize=False)
         else:
-            text_logits1, text_logits2 = self.text_classify(text_pooling)  
-            frame_logits1, frame_logits2 = self.frame_classify(frame_pooling)  
-            # union_logits1, union_logits2 = self.union_classify(union_pooling)
-            union_logits1, union_logits2 = (text_logits1+frame_logits1)/2, (text_logits2+frame_logits2)/2
-            # mid_text_logits1, mid_text_logits2 = self.mid_text_classify(text_mid_pooling)
-            # mid_frame_logits1, mid_frame_logits2 = self.mid_frame_classify(frame_mid_pooling)
-        
+            masked_vm_loss = torch.tensor(0, device='cuda')
+            
+        if 'itm' in sample_task:
+            itm_pred_text_cls = self.newfc_itm_text_cls(output_text_embeddings[:, 0, :])
+            itm_pred_frame_cls = self.newfc_itm_frame_cls(output_frame_embeddings[:, 0, :])
+            itm_pred = torch.cat([itm_pred_text_cls.view(-1), itm_pred_frame_cls.view(-1)])
+            video_text_match_label = torch.cat([video_text_match_label.view(-1), video_text_match_label.view(-1)])
+            loss_itm = nn.BCEWithLogitsLoss()(itm_pred, video_text_match_label)
+            itm_accuracy = torch.sum( (itm_pred>0.5).int() == video_text_match_label.int() ).float() / itm_pred.view(-1).shape[0]
+            # loss_itm += torch.log(loss_itm + 1e-12)
          
-        if inference:
-            return torch.argmax(union_logits2, dim=1)
-        else:
-            text_result = self.cal_loss(text_logits1, text_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            frame_result = self.cal_loss(frame_logits1, frame_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            union_result = self.cal_loss(union_logits1, union_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            # mid_text_result = self.cal_loss(mid_text_logits1, mid_text_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            # mid_frame_result = self.cal_loss(mid_frame_logits1, mid_frame_logits2, inputs['label_lv1'], inputs['label'], focal_loss=False)
-            loss =  text_result['loss'] +  frame_result['loss'] + itc_loss * 0.2
-            return  loss, text_result, frame_result, union_result # loss_category, accuracy, pred_label_id, label 
+        return   mlm_loss, loss_itm, mlm_accuracy, itm_accuracy, masked_vm_loss, itc_loss
     
     @staticmethod
     def cal_loss(prediction_lv1, prediction_lv2, label_lv1, label_lv2, focal_loss=False):
@@ -116,7 +147,35 @@ class WXUniModel(nn.Module):
             accuracy = (label_lv2 == pred_label_id).float().sum() / label_lv2.shape[0]
         result = {'loss': loss, 'accuracy': accuracy, 'pred_label_id': pred_label_id, 'label_lv2': label_lv2}
         return result
+        
+    
+    def calculate_mfm_loss(self, frame_feature_output, frame_feature_input, 
+                           frame_mask, video_labels_index, normalize=False, temp=0.1):
+        if normalize:
+            frame_feature_output = torch.nn.functional.normalize(frame_feature_output, p=2, dim=2)
+            frame_feature_input = torch.nn.functional.normalize(frame_feature_input, p=2, dim=2)
 
+        afm_scores_tr = frame_feature_output.view(-1, frame_feature_output.shape[-1])
+
+        video_tr = frame_feature_input.permute(2, 0, 1)
+        video_tr = video_tr.view(video_tr.shape[0], -1)
+
+        logits_matrix = torch.mm(afm_scores_tr, video_tr)
+        if normalize:
+            logits_matrix = logits_matrix / temp
+
+        frame_mask_float = frame_mask.to(dtype=torch.float)
+        mask_matrix = torch.mm(frame_mask_float.view(-1, 1), frame_mask_float.view(1, -1))
+        masked_logits = logits_matrix + (1. - mask_matrix) * -1e8
+
+        logpt = F.log_softmax(masked_logits, dim=-1)
+        logpt = torch.diag(logpt)
+        nce_loss = -logpt
+
+        video_labels_index_mask = (video_labels_index != -100)
+        nce_loss = nce_loss.masked_select(video_labels_index_mask.view(-1))
+        nce_loss = nce_loss.mean()
+        return nce_loss
 
 def gelu(x):
     """Implementation of the gelu activation function.
@@ -130,17 +189,58 @@ def swish(x):
 
 ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
+class VisualPredictionHeadTransform(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if isinstance(config.hidden_act, str):
+            self.transform_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.transform_act_fn = config.hidden_act
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states)
+        return hidden_states
+
+class VisualLMPredictionHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.transform = VisualPredictionHeadTransform(config)
+
+        # The output weights are the same as the input embeddings, but there is
+        # an output-only bias for each token.
+        self.decoder = nn.Linear(config.hidden_size, 768, bias=False)
+        self.bias = nn.Parameter(torch.zeros(768))
+
+        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
+        self.decoder.bias = self.bias
+
+    def forward(self, hidden_states):
+        hidden_states = self.transform(hidden_states)
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+
+class VisualOnlyMLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.predictions = VisualLMPredictionHead(config)
+
+    def forward(self, sequence_output):
+        prediction_scores = self.predictions(sequence_output)
+        return prediction_scores
     
 class UniBertForMaskedLM(BertPreTrainedModel):
-    def __init__(self, config, cls_head=False):
+    def __init__(self, config):
         super().__init__(config)
         self.bert = UniBert(config)
-        if cls_head:
-            self.cls = BertOnlyMLMHead(config)
+        self.cls = BertOnlyMLMHead(config)
         
     # Copied from transformers.models.bert.modeling_bert.BertModel.forward
     def forward(self, input_ids=None, mask=None, token_type_ids=None, gather_index=None, inputs_embeds=None, modal_type='text', frame_mask=None, 
-                frame_token_type_ids=None, output_hidden_states=False, return_mlm=False):
+                frame_token_type_ids=None, output_hidden_states=True, return_mlm=False):
         encoder_outputs = self.bert(input_ids, mask, token_type_ids, gather_index, inputs_embeds, modal_type, frame_mask,
                                     frame_token_type_ids, output_hidden_states)
         frame_len = frame_mask.size()[1]
@@ -155,13 +255,15 @@ class UniBert(BertPreTrainedModel):
         self.config = config
 
         self.embeddings = BertEmbeddings(config)
-        self.frame_fc = nn.Linear(768, self.config.hidden_size, bias=False)
+        # self.video_fc1 = torch.nn.Linear(768, config.hidden_size)
+        # self.video_fc2 = torch.nn.Linear(config.hidden_size, config.hidden_size)
+        # self.video_embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
         # frame_config = copy.deepcopy(config)
         # frame_config.num_hidden_layers = 3
         # self.frame_encoder = BertEncoder(frame_config)
         self.cls_token_id = None
-        self.unused_token_id = [1, 2, 3]
+        self.frame_fc = nn.Linear(768, self.config.hidden_size, bias=False)
 
         self.init_weights()
         
@@ -213,28 +315,16 @@ class UniBert(BertPreTrainedModel):
         unused_mask2 = (torch.cat([mask, torch.zeros(mask.shape[0], len(self.unused_token_id), device=mask.device), torch.ones(mask.shape[0], len(self.unused_token_id), device=mask.device), torch.zeros_like(frame_mask)], dim=-1)[:, None, None, :]).expand(-1, -1, len(self.unused_token_id), -1)
         unused_mask2  = ((1.0 - unused_mask2 ) * -1000000.0).float()
         union_mask = torch.cat([union_text_mask , unused_mask1, unused_mask2, union_frame_mask], dim=2)
-        union_output_embeddings =  self.encoder(union_input_embeddings, union_mask, start_layer=6, end_layer=12)['last_hidden_state']    
-        output_embeddings_text, output_embeddings_frame = union_output_embeddings[:, :union_text_mask.shape[2], :], union_output_embeddings[:, -union_frame_mask.shape[2]:, :]
-        
-        # unused_embeddings = self.embeddings.word_embeddings(torch.tensor(self.unused_token_id, device=mask.device)).expand(frame_mask.shape[0], -1, -1)
-        # union_input_embeddings = torch.cat([text_embeddings, unused_embeddings, frame_embeddings], dim=1)
-        # union_text_mask = (torch.cat([mask, torch.ones(mask.shape[0], len(self.unused_token_id), device=mask.device),  torch.zeros_like(frame_mask)], dim=-1)[:, None, None, :]).expand(-1, -1, mask.shape[1], -1)
-        # union_text_mask  = ((1.0 - union_text_mask ) * -1000000.0).float()
-        # union_frame_mask = (torch.cat([torch.zeros_like(mask), torch.ones(frame_mask.shape[0], len(self.unused_token_id), device=frame_mask.device), frame_mask], dim=-1)[:, None, None, :]).expand(-1, -1, frame_mask.shape[1], -1)
-        # union_frame_mask  = ((1.0 - union_frame_mask ) * -1000000.0).float()
-        # unused_mask1 = (torch.cat([mask, torch.ones(mask.shape[0], len(self.unused_token_id), device=mask.device), frame_mask], dim=-1)[:, None, None, :]).expand(-1, -1, len(self.unused_token_id), -1)
-        # unused_mask1  = ((1.0 - unused_mask1 ) * -1000000.0).float()
-        # union_mask = torch.cat([union_text_mask , unused_mask1, union_frame_mask], dim=2)
-        # union_output_embeddings =  self.encoder(union_input_embeddings, union_mask, start_layer=0, end_layer=12)['last_hidden_state']
+        union_output_embeddings =  self.encoder(union_input_embeddings, union_mask, start_layer=6, end_layer=12)['last_hidden_state']
 
-        # output_embeddings_text, output_embeddings_frame = union_output_embeddings[:, :union_text_mask.shape[2], :], union_output_embeddings[:, -union_frame_mask.shape[2]:, :]
+        output_embeddings_text, output_embeddings_frame = union_output_embeddings[:, :single_text_mask.shape[2], :], union_output_embeddings[:, -single_frame_mask.shape[2]:, :]
         
         output = dict(
             frame_embeddings=output_embeddings_frame, 
             text_embeddings=output_embeddings_text,
             union_embeddings=union_output_embeddings,
-            single_text_mid_output_embeddings=single_text_mid_output_embeddings,
-            single_frame_mid_output_embeddings=single_frame_mid_output_embeddings
+            mid_frame_embeddings = single_frame_mid_output_embeddings,
+            mid_text_embeddings = single_text_mid_output_embeddings
         )
         return output
     
@@ -268,3 +358,4 @@ class Classify(nn.Module):
             logits1 = self.fc1(input) + self.prior_lv1.unsqueeze(dim=0)
             logits2 = self.fc2(input) + self.prior_lv2.unsqueeze(dim=0)
         return logits1, logits2
+
